@@ -25,6 +25,7 @@ dependencies = [
     "textarena>=0.7.4",
     "math-verify",
     "scipy",
+    "litellm>=1.80.10",
 ]
 
 [project.urls]

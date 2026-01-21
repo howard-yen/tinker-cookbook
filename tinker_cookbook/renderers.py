@@ -428,7 +428,7 @@ def tokens_weights_from_strings_weights(
 
 
 def parse_response_for_stop_token(
-    response: list[int], tokenizer: Tokenizer, stop_token: int
+    response: list[int], tokenizer: Tokenizer, stop_token: int | list[int]
 ) -> tuple[Message, bool]:
     """Parse response for a single stop token.
 
@@ -436,13 +436,23 @@ def parse_response_for_stop_token(
     ran out of tokens when sampling, which will incur a format error. If there are > 1, there is likely a bug in the
     sampler and we should error.
     """
-    emt_count = response.count(stop_token)
+    if isinstance(stop_token, list):
+        emt_count = sum(response.count(token) for token in stop_token)
+    else:
+        emt_count = response.count(stop_token)
+
     if emt_count == 0:
         str_response = tokenizer.decode(response)
         logger.debug(f"Response is not a valid assistant response: {str_response}")
         return Message(role="assistant", content=str_response), False
     elif emt_count == 1:
-        str_response = tokenizer.decode(response[: response.index(stop_token)])
+        # stop at the first stop token
+        if isinstance(stop_token, list):
+            end_idx = min(response.index(token) for token in stop_token if token in response)
+        else:
+            end_idx = response.index(stop_token)
+        # include the stop token in the response to make parsing easier
+        str_response = tokenizer.decode(response[: end_idx+1])
         return Message(role="assistant", content=str_response), True
     else:
         raise ValueError(
@@ -1217,9 +1227,12 @@ class GptOssRenderer(Renderer):
         assert use_system_prompt == (reasoning_effort is not None), (
             "Reasoning effort must be set iff using system prompt"
         )
+        from openai_harmony import HarmonyEncodingName, load_harmony_encoding
+        self.encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
     def render_message(self, idx: int, message: Message, is_last: bool = False) -> RenderedMessage:
-        assert message.get("tool_calls") is None, "TODO: support tools in gpt-oss renderer"
+        # Adding support for tools in gpt-oss...
+        # assert message.get("tool_calls") is None, "TODO: support tools in gpt-oss renderer"
         assert isinstance(message["content"], str), (
             "GptOssRenderer only supports message with string content"
         )
@@ -1227,6 +1240,7 @@ class GptOssRenderer(Renderer):
         ob_str = f"<|start|>{message['role']}"
         # Action part
         ac_str = ""
+        use_tools = False
         if message["role"] == "assistant":
             # TODO: support commentary channel / tools
 
@@ -1241,15 +1255,30 @@ class GptOssRenderer(Renderer):
                     # Analysis channel only included in the last message. See https://cookbook.openai.com/articles/gpt-oss/handle-raw-cot
                     ac_str += f"<|channel|>analysis<|message|>{thinking}<|end|><|start|>assistant"
 
-            # Final channel (Response Content)
-            ac_str += f"<|channel|>final<|message|>{message_content}"
+            if "tool_calls" in message:
+                use_tools = True
+                # working on this...
+                for tool_call in message["tool_calls"]:
+                    ac_str += f"<|start|>assistant to=functions.{tool_call.function.name}<|channel|>commentary <|constrain|> json<|message|>{json.dumps(tool_call.function.arguments)}"
+            else:
+                # Final channel (Response Content)
+                ac_str += f"<|channel|>final<|message|>{message_content}"
+
+        elif message["role"] == "tool":
+            assert message.get("name") is not None, "Tool message must have a name"
+            assert message.get("content") is not None, "Tool message must have a content"
+            ac_str += f"<|start|>functions.{message['name']}<|channel|>commentary<|message|>{message['content']}"
+
         else:
             assert message.get("thinking") is None, (
                 "Thinking is only allowed for assistant messages"
             )
             ac_str += f"<|message|>{message['content']}"
 
-        if not is_last:
+
+        if use_tools:
+            ac_str += "<|call|>"
+        elif not is_last:
             ac_str += "<|end|>"
         else:
             # <|return|> ends the last-message in harmony (but should be replaced by <|end|> when continuing the convo)
@@ -1285,17 +1314,55 @@ class GptOssRenderer(Renderer):
         return tokens
 
     @property
-    def _return_token(self) -> int:
-        res = self.tokenizer.encode("<|return|>", add_special_tokens=False)
-        assert len(res) == 1, f"Expected single token for <|return|>, got {len(res)}"
-        return res[0]
+    def _return_token(self) -> list[int]:
+        # see generation_config.json in the HF tokenizer repo. this is necessary to support tool calling
+        res = self.tokenizer.encode("<|return|><|endoftext|><|call|>", add_special_tokens=False)
+        assert len(res) == 3, f"Expected 3 tokens for <|return|><|endoftext|><|call|>, got {len(res)}"
+        return res
 
     def get_stop_sequences(self) -> list[int]:
-        return [self._return_token]
+        return self._return_token
 
     def parse_response(self, response: list[int]) -> tuple[Message, bool]:
-        return parse_response_for_stop_token(response, self.tokenizer, self._return_token)
+        # parse the assitant message first
+        assistant_message, parse_success = parse_response_for_stop_token(response, self.tokenizer, self._return_token)
+        if not parse_success:
+            return assistant_message, False
+        
+        content = assistant_message["content"]
+        assert isinstance(content, str), "GptOssRenderer only supports string content"
+        
+        # Extract the thinking content, which is in the between <|channel|>analysis<|message|>...<|end|>
+        think_match = re.search(r"<\|channel\|>analysis<\|message\|>(.*?)<\|end\|>", content, re.DOTALL)
+        if think_match:
+            thinking = think_match.group(1)
+            assistant_message["thinking"] = thinking
+            content = content[think_match.end() :].lstrip()
+            assistant_message["content"] = content
+        
+        # Extract the tool calls if present, which is in between <|start|>assistant to=functions.tool_name<|channel|>commentary <|constrain|> json<|message|>...<|call|>
+        tool_call_match = re.search(r"<\|start\|>assistant<\|channel\|>(.*) to=functions\.(\w+)[ ]?(?:<\|channel\|>commentary)?[ ]?(?:code|<\|constrain\|>json|<\|constrain\|>=json|json)?<\|message\|>(.*)<\|call\|>", content, re.DOTALL)
+        if tool_call_match:
+            tool_channel = tool_call_match.group(1)
+            tool_name = tool_call_match.group(2)
+            tool_args = tool_call_match.group(3)
+            assistant_message["tool_calls"] = [
+                ToolCall(
+                    function=ToolCall.FunctionBody(name=tool_name, arguments=tool_args),
+                )
+            ]
+            content = content[tool_call_match.end() :].lstrip()
+            assistant_message["content"] = content
 
+            if len(tool_name) > 7:
+                # something is wrong and we need to check this
+                import pdb; pdb.set_trace()
+                assert False, f"tool name is too long: {tool_name}\n\ntool_call_match: {tool_call_match}\n\ntool_channel: {tool_channel}\n\ntool_args: {tool_args}\n\ncontent: {content}"
+        else:
+            assert "to=functions." not in content, f"expected to parse tool calls, but found {content}"
+
+        return assistant_message, True
+       
 
 def get_renderer(
     name: str, tokenizer: Tokenizer, image_processor: ImageProcessor | None = None
