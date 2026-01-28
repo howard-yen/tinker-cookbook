@@ -5,12 +5,14 @@ CLI for Self-Play training
 import asyncio
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import chz
 from tinker_cookbook import cli_utils, model_info
 from tinker_cookbook.recipes.tool_use.self_play.search_env import SPDatasetBuilder
 from tinker_cookbook.recipes.tool_use.self_play.search_utils import WebSearchToolConfig
 from tinker_cookbook.rl import train
+from tinker.types import LossFnType
 
 
 @chz.chz
@@ -21,6 +23,7 @@ class CLIConfig:
     renderer_name: str | None = None
 
     # Training parameters
+    loss_fn: LossFnType = "importance_sampling"
     learning_rate: float = 4e-5
     batch_size: int = 512
     seed: int = 2
@@ -32,6 +35,12 @@ class CLIConfig:
     max_trajectory_tokens: int = 8 * 1024
     max_num_calls: int = 4
     n_batches: int | None = None  # If set, limits the number of training batches
+
+    # Self-play parameters
+    self_play: bool = True
+    handling_mode: Literal["raise", "return", "continue"] = "raise"
+    difficulty_reward_mode: Literal["variance", "linear", "none"] = "variance"
+    tool_reward_mode: Literal["max", "mean", "none"] = "max"
 
     # Web tool parameters
     web_tool_port: int = 8000
@@ -81,6 +90,9 @@ async def cli_main(cli_config: CLIConfig):
         max_trajectory_tokens=cli_config.max_trajectory_tokens,
         max_num_calls=cli_config.max_num_calls,
         n_batches=cli_config.n_batches,
+        handling_mode=cli_config.handling_mode,
+        difficulty_reward_mode=cli_config.difficulty_reward_mode,
+        tool_reward_mode=cli_config.tool_reward_mode,
     )
 
     # Configure streaming minibatch
@@ -97,7 +109,7 @@ async def cli_main(cli_config: CLIConfig):
     # Build run name
     model_name_short = cli_config.model_name.lower().replace("/", "-")
     date_and_time = datetime.now().strftime("%Y-%m-%d-%H-%M")
-    run_name = f"self_play{cli_config.run_tag}_{model_name_short}_{bs_str}_gs{cli_config.group_size}_seed{cli_config.seed}_tracj{cli_config.max_trajectory_tokens // 1024}k_lr{cli_config.learning_rate}_rank{cli_config.lora_rank}_nc{cli_config.max_num_calls}_{date_and_time}"
+    run_name = f"self_play{cli_config.run_tag}_{model_name_short}_{bs_str}_gs{cli_config.group_size}_seed{cli_config.seed}_tracj{cli_config.max_trajectory_tokens // 1024}k_lr{cli_config.learning_rate}_rank{cli_config.lora_rank}_nc{cli_config.max_num_calls}_hm{cli_config.handling_mode}_drm{cli_config.difficulty_reward_mode}_trm{cli_config.tool_reward_mode}_{date_and_time}"
 
     # Set log path
     if cli_config.log_path is not None:
@@ -130,6 +142,7 @@ async def cli_main(cli_config: CLIConfig):
         wandb_name=wandb_name,
         lora_rank=cli_config.lora_rank,
         stream_minibatch_config=stream_minibatch_config,
+        loss_fn=cli_config.loss_fn,
     )
 
     # Run training

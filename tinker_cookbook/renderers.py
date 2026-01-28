@@ -1257,7 +1257,6 @@ class GptOssRenderer(Renderer):
 
             if "tool_calls" in message:
                 use_tools = True
-                # working on this...
                 for tool_call in message["tool_calls"]:
                     ac_str += f"<|start|>assistant to=functions.{tool_call.function.name}<|channel|>commentary <|constrain|> json<|message|>{json.dumps(tool_call.function.arguments)}"
             else:
@@ -1341,7 +1340,7 @@ class GptOssRenderer(Renderer):
             assistant_message["content"] = content
         
         # Extract the tool calls if present, which is in between <|start|>assistant to=functions.tool_name<|channel|>commentary <|constrain|> json<|message|>...<|call|>
-        tool_call_match = re.search(r"<\|start\|>assistant<\|channel\|>(.*) to=functions\.(\w+)[ ]?(?:<\|channel\|>commentary)?[ ]?(?:code|<\|constrain\|>json|<\|constrain\|>=json|json)?<\|message\|>(.*)<\|call\|>", content, re.DOTALL)
+        tool_call_match = re.search(r"<\|start\|>assistant<\|channel\|>(.*) to=functions\.(\w+)[ ]?(?:<\|channel\|>commentary)?[ ]?(?:<\|constrain\|>)?(?:=code|code|=json|json)?<\|message\|>(.*)<\|call\|>", content, re.DOTALL)
         if tool_call_match:
             tool_channel = tool_call_match.group(1)
             tool_name = tool_call_match.group(2)
@@ -1354,10 +1353,6 @@ class GptOssRenderer(Renderer):
             content = content[tool_call_match.end() :].lstrip()
             assistant_message["content"] = content
 
-            if len(tool_name) > 7:
-                # something is wrong and we need to check this
-                import pdb; pdb.set_trace()
-                assert False, f"tool name is too long: {tool_name}\n\ntool_call_match: {tool_call_match}\n\ntool_channel: {tool_channel}\n\ntool_args: {tool_args}\n\ncontent: {content}"
         else:
             assert "to=functions." not in content, f"expected to parse tool calls, but found {content}"
 
