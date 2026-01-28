@@ -12,11 +12,14 @@ dependencies = [
     "cloudpickle",
     "datasets",
     "numpy",
+    "pillow",
     "rich",
     "termcolor",
-    "tinker>=0.6.1",
+    "tinker>=0.9.0",
     "torch",
-    "transformers",
+    "torchvision",
+    # <4.57: mistral regex bug makes API calls even with local_files_only=True (fixed in PR #42743)
+    "transformers>=4.45.0,<4.57.0",
     "blobfile",
     "inspect-ai",
     "anyio",
@@ -26,6 +29,10 @@ dependencies = [
     "math-verify",
     "scipy",
     "litellm>=1.80.10",
+    "pytest>=9.0.2",
+    "tiktoken>=0.12.0", # Required for Kimi tokenizer
+    "tqdm",
+    "modal",
 ]
 
 [project.urls]
@@ -55,7 +62,7 @@ trackio = [
     "trackio<1.0.0",
 ]
 verifiers = [
-    "verifiers>=0.1.8.post0",
+    "verifiers>=0.1.9,<0.1.10",
     "openai",
 ]
 all = [

@@ -30,6 +30,7 @@ class Config:
     train_on_what: renderers.TrainOnWhat = renderers.TrainOnWhat.ALL_ASSISTANT_MESSAGES
     lora_rank: int = 32
     save_every: int = 20  # 0 = disabled
+    ttl_seconds: int = 604800  # 7 days
 
 
 def main(config: Config):
@@ -93,6 +94,7 @@ def main(config: Config):
                 log_path=config.log_path,
                 kind="state",
                 loop_state={"batch": batch_idx},
+                ttl_seconds=config.ttl_seconds,
             )
 
         # Linear learning rate schedule
@@ -120,7 +122,10 @@ def main(config: Config):
         optim_step_future = training_client.optim_step(adam_params)
 
         fwd_bwd_result = fwd_bwd_future.result()
-        _optim_result = optim_step_future.result()
+        optim_result = optim_step_future.result()
+
+        if optim_result.metrics:
+            metrics.update(optim_result.metrics)
 
         # Compute train metrics
         train_logprobs = [x["logprobs"] for x in fwd_bwd_result.loss_fn_outputs]
@@ -145,6 +150,7 @@ def main(config: Config):
         log_path=config.log_path,
         kind="both",
         loop_state={"batch": n_train_batches},
+        ttl_seconds=config.ttl_seconds,
     )
 
     ml_logger.close()

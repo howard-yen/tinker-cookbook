@@ -11,6 +11,7 @@ from typing import Any, cast
 import chz
 import tinker
 import torch
+import torch.nn.functional as F
 from tinker_cookbook import checkpoint_utils
 from tinker_cookbook.eval.evaluators import Evaluator, EvaluatorBuilder
 from tinker_cookbook.supervised.train import run_evals
@@ -54,6 +55,7 @@ class Config:
     save_every: int = 20
     eval_every: int = 10
     infrequent_eval_every: int = 100
+    ttl_seconds: int = 604800  # 7 days
 
     # Adam optimizer parameters
     adam_beta1: float = 0.9
@@ -133,14 +135,14 @@ def compute_dpo_loss(
     )
 
     # Compute DPO loss
-    losses = -torch.log(torch.sigmoid(dpo_beta * (chosen_log_ratio - rejected_log_ratio)))
+    losses = -F.logsigmoid(dpo_beta * (chosen_log_ratio - rejected_log_ratio))
     loss = losses.mean()
 
     # Compute metrics
     accuracy = (chosen_log_ratio > rejected_log_ratio).float().mean().item()
     chosen_rewards = dpo_beta * chosen_log_ratio
     rejected_rewards = dpo_beta * rejected_log_ratio
-    margin = dpo_beta * (chosen_rewards - rejected_rewards).mean().item()
+    margin = (chosen_rewards - rejected_rewards).mean().item()
 
     metrics = {
         "dpo_loss": loss.item(),
@@ -182,6 +184,7 @@ def do_update(
                 log_path=log_path,
                 kind="both",
                 loop_state={"epoch": epoch_idx, "batch": batch_idx},
+                ttl_seconds=config.ttl_seconds,
             )
         if "state_path" in save_result:
             metrics["state_path"] = save_result["state_path"]
@@ -222,7 +225,7 @@ def do_update(
             print_example(rejected_data[i], tokenizer, "Rejected")
 
     with timed("get_ref_logprobs", metrics):
-        # Get reference log probabilities using synchronous compute_logprobs
+        # Get reference log probabilities
         # Need to reconstruct full sequences for the sampling client
         full_sequences = []
         for datum in data:
@@ -379,6 +382,7 @@ def main(config: Config):
             log_path=config.log_path,
             kind="both",
             loop_state={"epoch": config.num_epochs, "batch": n_batches},
+            ttl_seconds=config.ttl_seconds,
         )
     else:
         logger.info("Training was already complete; nothing to do")

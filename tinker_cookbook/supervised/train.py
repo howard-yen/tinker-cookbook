@@ -64,6 +64,7 @@ class Config:
     save_every: int = 20
     eval_every: int = 10
     infrequent_eval_every: int = 100
+    ttl_seconds: int = 604800  # 7 days
 
     # Adam optimizer parameters
     adam_beta1: float = 0.9
@@ -308,11 +309,15 @@ async def main(config: Config):
                     log_path=config.log_path,
                     loop_state={"epoch": submitted.epoch_idx, "batch": submitted.batch_idx},
                     kind="both",
+                    ttl_seconds=config.ttl_seconds,
                 )
 
         with timed("step", metrics):
             fwd_bwd_result = await submitted.fwd_bwd_future.result_async()
-            await submitted.optim_step_future.result_async()
+            optim_step_result = await submitted.optim_step_future.result_async()
+
+        if optim_step_result.metrics:
+            metrics.update(optim_step_result.metrics)
 
         logprobs = [x["logprobs"] for x in fwd_bwd_result.loss_fn_outputs]
         weights = [datum.loss_fn_inputs["weights"] for datum in submitted.data]
@@ -361,6 +366,7 @@ async def main(config: Config):
             log_path=config.log_path,
             kind="both",
             loop_state={"epoch": config.num_epochs, "batch": n_batches},
+            ttl_seconds=config.ttl_seconds,
         )
     else:
         logger.info("Training was already complete; nothing to do")
