@@ -13,7 +13,7 @@ import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal, NotRequired, Optional, Protocol, TypedDict
+from typing import Literal, NotRequired, Optional, Protocol, TypedDict, Union
 
 import pydantic
 import tinker
@@ -141,6 +141,164 @@ class UnparsedToolCallPart(TypedDict):
 
 # Container for a part of a multimodal message content
 ContentPart = TextPart | ImagePart | ThinkingPart | ToolCallPart | UnparsedToolCallPart
+
+
+# Streaming types to enable incremental parsing of model output for real-time display.
+
+
+@dataclass
+class StreamingMessageHeader:
+    """Emitted at the start of a new message during streaming.
+
+    This signals that a new message is beginning and provides the author info.
+    """
+
+    role: str
+    name: str | None = None
+
+
+@dataclass
+class StreamingTextDelta:
+    """Incremental text content during streaming.
+
+    Contains only the new text since the last delta, not the accumulated text.
+    The recipient should concatenate deltas to build the full content.
+    """
+
+    text: str
+    content_index: int = 0
+    """Index of this content block within the message. Increments when content type changes."""
+
+
+@dataclass
+class StreamingThinkingDelta:
+    """Incremental thinking/reasoning content during streaming.
+
+    Contains only the new thinking text since the last delta.
+    """
+
+    thinking: str
+    content_index: int = 0
+    """Index of this content block within the message. Increments when content type changes."""
+
+
+# Union of all streaming update types.
+# A streaming parser yields these in sequence:
+# 1. StreamingMessageHeader (once at start)
+# 2. StreamingTextDelta / StreamingThinkingDelta (as content arrives)
+# 3. Message (once at end, containing the complete parsed message)
+MessageDelta = Union[StreamingMessageHeader, StreamingTextDelta, StreamingThinkingDelta, "Message"]
+
+
+# Unicode replacement character - indicates incomplete/invalid UTF-8 sequence
+_REPLACEMENT_CHAR = "\ufffd"
+
+
+@dataclass
+class Utf8TokenDecoder:
+    """Handles incremental UTF-8 decoding from tokens.
+
+    Tokens can split multi-byte UTF-8 sequences (e.g., a 3-byte character
+    might be split across 2 tokens). This class buffers tokens until a
+    valid UTF-8 string can be decoded.
+
+    Detection strategy:
+    1. Try decoding all pending + new tokens
+    2. If result contains trailing U+FFFD (replacement char), it's incomplete
+    3. Scan backwards to find longest prefix without trailing replacement chars
+    4. Emit that prefix, buffer the rest
+
+    This handles tiktoken-style tokenizers that return replacement chars
+    instead of throwing exceptions for incomplete UTF-8.
+    """
+
+    tokenizer: "Tokenizer"
+    _pending_tokens: list[int] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self._pending_tokens is None:
+            self._pending_tokens = []
+
+    # Max tokens to try removing from the end when looking for decodable prefix.
+    # UTF-8 chars are max 4 bytes, tokens typically 1-4 bytes each,
+    # so 8 tokens is plenty to cover any incomplete trailing sequence.
+    _MAX_TRAILING_TOKENS_TO_TRY: int = 8
+
+    def _is_valid_decode(self, text: str) -> bool:
+        """Check if decoded text represents a complete UTF-8 sequence.
+
+        Returns False if the text ends with a replacement character,
+        which indicates an incomplete multi-byte sequence that needs
+        more tokens to complete.
+        """
+        return not text.endswith(_REPLACEMENT_CHAR)
+
+    def decode(self, tokens: list[int]) -> str | None:
+        """Decode tokens to string, buffering incomplete UTF-8 sequences.
+
+        Args:
+            tokens: New tokens to decode.
+
+        Returns:
+            Decoded string if complete UTF-8 sequences are available,
+            None if all tokens were buffered (incomplete sequence).
+        """
+        self._pending_tokens.extend(tokens)
+
+        # Try to decode all pending tokens (common case)
+        try:
+            text = self.tokenizer.decode(self._pending_tokens)
+            if self._is_valid_decode(text):
+                self._pending_tokens = []
+                return text
+            # Has trailing replacement chars - fall through to find valid prefix
+        except Exception:
+            pass
+
+        # Scan backwards to find longest decodable prefix without replacement chars.
+        # We only need to try removing a few tokens since UTF-8 sequences are at
+        # most 4 bytes and tokens are typically 1-4 bytes each.
+        for remove in range(
+            1, min(len(self._pending_tokens), self._MAX_TRAILING_TOKENS_TO_TRY) + 1
+        ):
+            prefix = self._pending_tokens[:-remove]
+            if not prefix:
+                break
+            try:
+                text = self.tokenizer.decode(prefix)
+                if self._is_valid_decode(text):
+                    self._pending_tokens = self._pending_tokens[-remove:]
+                    return text
+            except Exception:
+                continue
+
+        # All tokens buffered - need more data
+        return None
+
+    def flush(self) -> str:
+        """Force decode any remaining tokens.
+
+        Call this at end of stream. May produce replacement characters
+        for incomplete sequences.
+        """
+        if not self._pending_tokens:
+            return ""
+        try:
+            text = self.tokenizer.decode(self._pending_tokens)
+        except Exception:
+            # Last resort: decode with errors='replace' behavior
+            # Most tokenizers handle this, but fall back to empty string
+            text = ""
+        self._pending_tokens = []
+        return text
+
+    def reset(self) -> None:
+        """Clear any buffered tokens."""
+        self._pending_tokens = []
+
+    def has_pending(self) -> bool:
+        """Check if there are buffered tokens waiting for more data."""
+        return len(self._pending_tokens) > 0
 
 
 # NOTE: we use a broad type definition for the role to be flexible
@@ -520,6 +678,7 @@ class RenderedMessage:
 
 class TrainOnWhat(StrEnum):
     LAST_ASSISTANT_MESSAGE = "last_assistant_message"
+    LAST_ASSISTANT_TURN = "last_assistant_turn"
     ALL_ASSISTANT_MESSAGES = "all_assistant_messages"
     ALL_MESSAGES = "all_messages"
     ALL_TOKENS = "all_tokens"
@@ -771,6 +930,28 @@ class Renderer(ABC):
             )
         return tinker.ModelInput(chunks=chunks)
 
+    def build_supervised_examples(
+        self,
+        messages: list[Message],
+        train_on_what: TrainOnWhat = TrainOnWhat.LAST_ASSISTANT_TURN,
+    ) -> list[tuple[tinker.ModelInput, torch.Tensor]]:
+        """
+        Build tokens and per-token weights for supervised fine-tuning.
+        This function returns a list of examples in the form of tuples, where each tuple contains a model input and a tensor of weights.
+        This is needed because some renderers do not satisfy the extension property, so we need to return a list of examples instead of a single example.
+
+        This default implementation concatenates rendered messages in order, which assumes the renderer satisfies the extension property.
+        Override this method if your renderer does not satisfy the extension property.
+        """
+
+        if self.has_extension_property:
+            return [self.build_supervised_example(messages, train_on_what=train_on_what)]
+        else:
+            # TODO: Add a default implementation that calls `build_supervised_example` for each message and merges examples with shared prefixes.
+            raise NotImplementedError(
+                "build_supervised_examples has not been implemented for this renderer."
+            )
+
     def build_supervised_example(
         self,
         messages: list[Message],
@@ -793,6 +974,7 @@ class Renderer(ABC):
             messages: A list of messages to render.
             train_on_what: Controls which tokens receive non-zero training weight:
                 - LAST_ASSISTANT_MESSAGE: Only the last assistant message
+                - LAST_ASSISTANT_TURN: The last assistant message after the last user message
                 - ALL_ASSISTANT_MESSAGES: All assistant messages
                 - ALL_MESSAGES: All messages (but not headers)
                 - ALL_TOKENS: Everything including headers
@@ -826,6 +1008,10 @@ class Renderer(ABC):
                 (tinker.types.EncodedTextChunk(tokens=self._bos_tokens), 0.0)
             )
 
+        last_user_idx = max(
+            idx for idx, message in enumerate(messages) if message["role"] == "user"
+        )
+
         for idx, message in enumerate(messages):
             if train_on_what == TrainOnWhat.CUSTOMIZED:
                 assert "trainable" in message, (
@@ -839,6 +1025,7 @@ class Renderer(ABC):
             is_last_message = idx == len(messages) - 1
             is_assistant = message["role"] == "assistant"
             is_user_or_system = message["role"] in ["user", "system"]
+            is_after_last_user = last_user_idx == -1 or idx > last_user_idx
 
             # only apply weight to header if train_on_what is ALL_TOKENS
             ctx = RenderContext(
@@ -858,6 +1045,8 @@ class Renderer(ABC):
             match train_on_what:
                 case TrainOnWhat.LAST_ASSISTANT_MESSAGE:
                     output_has_weight = is_last_message and is_assistant
+                case TrainOnWhat.LAST_ASSISTANT_TURN:
+                    output_has_weight = is_assistant and is_after_last_user
                 case TrainOnWhat.ALL_ASSISTANT_MESSAGES:
                     output_has_weight = is_assistant
                 case TrainOnWhat.ALL_MESSAGES:
@@ -925,9 +1114,7 @@ def parse_response_for_stop_token(
         )
 
 
-# ============================================================================
 # Image processing utilities (used by VL renderers)
-# ============================================================================
 
 
 class ImageProcessorProtocol(Protocol):
