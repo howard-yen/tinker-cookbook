@@ -21,6 +21,7 @@ class CLIConfig:
     model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
     lora_rank: int = 32
     renderer_name: str | None = None
+    vector_search: bool = False
 
     # Training parameters
     loss_fn: LossFnType = "importance_sampling"
@@ -32,15 +33,18 @@ class CLIConfig:
 
     # Dataset parameters
     group_size: int = 8
+    eval_group_size: int = 4
+    eval_max_num_calls: int = 10
     max_trajectory_tokens: int = 8 * 1024
     max_num_calls: int = 4
     n_batches: int | None = None  # If set, limits the number of training batches
+    eval_n_batches: int = 100 # this should always be set to control number of eval baatches
 
     # Self-play parameters
     self_play: bool = True
     handling_mode: Literal["raise", "return", "continue"] = "raise"
     difficulty_reward_mode: Literal["variance", "linear", "none"] = "variance"
-    tool_reward_mode: Literal["max", "mean", "none"] = "max"
+    tool_reward_mode: Literal["max", "mean", "min", "none"] = "min"
 
     # Web tool parameters
     web_tool_port: int = 8000
@@ -59,6 +63,7 @@ class CLIConfig:
     wandb_project: str | None = None
     wandb_name: str | None = None
     run_tag: str = ""
+    save_every: int = 1
 
     behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
 
@@ -72,6 +77,7 @@ async def cli_main(cli_config: CLIConfig):
         scoring_func=cli_config.web_tool_scoring_func,
         chunking_func=cli_config.web_tool_chunking_func,
         timeout=cli_config.web_tool_timeout,
+        vector_search=cli_config.vector_search,
     )
 
     # Get renderer name
@@ -83,13 +89,16 @@ async def cli_main(cli_config: CLIConfig):
     builder = SPDatasetBuilder(
         batch_size=cli_config.batch_size,
         group_size=cli_config.group_size,
+        eval_group_size=cli_config.eval_group_size,
         renderer_name=renderer_name,
         model_name_for_tokenizer=cli_config.model_name,
         search_tool_config=web_tool_config,
         seed=cli_config.seed,
         max_trajectory_tokens=cli_config.max_trajectory_tokens,
         max_num_calls=cli_config.max_num_calls,
+        eval_max_num_calls=cli_config.eval_max_num_calls,
         n_batches=cli_config.n_batches,
+        max_eval_size=cli_config.eval_n_batches,
         handling_mode=cli_config.handling_mode,
         difficulty_reward_mode=cli_config.difficulty_reward_mode,
         tool_reward_mode=cli_config.tool_reward_mode,
@@ -143,6 +152,7 @@ async def cli_main(cli_config: CLIConfig):
         lora_rank=cli_config.lora_rank,
         stream_minibatch_config=stream_minibatch_config,
         loss_fn=cli_config.loss_fn,
+        save_every=cli_config.save_every,
     )
 
     # Run training

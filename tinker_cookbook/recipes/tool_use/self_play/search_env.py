@@ -28,6 +28,7 @@ from tinker_cookbook.rl.types import (
     RLDatasetBuilder,
     StepResult,
 )
+from tinker_cookbook.renderers.base import get_text_content
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.utils import logtree
 from tinker_cookbook.recipes.tool_use.self_play.search_utils import WebSearchTool, WebSearchToolConfig
@@ -68,87 +69,6 @@ query_list?: string[] | null,
 } // namespace functions
 """.strip()
 
-# Tool calling. Execute the tool by wrapping calls in <tool_call>...</tool_call>
-CHALLENGER_SYSTEM_PROMPT = """
-You are an expert teacher who writes challenging questions for a student to answer.
-You are given a document and a url as the starting point, and you will have access to tools to help you collect more information to write a challenging problem.
-Use the tools to write a challenging, clear, motivated, and solvable problem.
-
-When using tools, make sure to write your arguments in the correct format, you should output a json string with the following format:
-{
-    "name": "the name of the tool you are calling",
-    "args": "the arguments of the tool in a json dictionary",
-}
-
-The search tool you are given has the following schema:
-```
-{
-    "name": "search",
-    "title": "Search the web",
-    "description": "Search the web for relevant information with the queries. This tool will return a list of urls with a snippet of the content in the url for each query.",
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "query_list": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "A list of fully-formed semantic queries. This tool will return search results for each query.",
-            }
-        },
-        "required": ["query_list"],
-    },
-    "outputSchema": {
-        "type": "string",
-        "description": "The search results in JSON format",
-    },
-}
-```
-
-The browse tool you are given has the following schema:
-```
-{
-    "name": "browse",
-    "title": "Browse the web",
-    "description": "Browse the urls. This tool will return a snippet of the content in each url. Optionally, you can search for a specific query in each url, and the tool will perform fuzzy matching to find the part of the page that contains the highest textual similarity to the query.",
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "url_list": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "A list of urls to browse. The tool will return a snippet of the content in each url.",
-            },
-            "query_list": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "A list of queries to search for in each url. The tool will perform fuzzy matching to find the part of the page that contains the highest textual similarity to the query. If given an empty query, the tool will return the beginning of the page.",
-            },
-        },
-        "required": ["url_list"],
-    },
-    "outputSchema": {
-        "type": "string",
-        "description": "The browse results in JSON format",
-    },
-}
-```
-
-Use the tools to collect information to write a challenging, clear, motivated, and solvable problem. Use the given document and url as a starting point. 
-For example, you may use the tools to collect more information about the topic of the document.
-Then, after you have collected enough information, write a problem with both the question statement and the answer. 
-The question should require reasoning over many documents to answer, so you should use the tools at least once to collect more documents.
-Both the question statement and the answer should be clear, unambiguous, and concise, the answer should be easily verifiable and does not exceed more than 20 words. 
-
-Write your final output in the json format:
-```json
-{
-    "question": "The question statement of the problem",
-    "answer": "The answer to the problem",
-    "explanation": "The explanation of the problem and what document sources were used to answer the question",
-}
-```
-""".strip()
-
 
 CHALLENGER_FALLBACK_SYSTEM_PROMPT = """
 You are an expert teacher who writes challenging questions for a student to answer.
@@ -167,12 +87,10 @@ Write your final output in the json format:
 """.strip()
 
 
-
-
-# for gpt oss
-GPT_OSS_CHALLENGER_SYSTEM_PROMPT = """
+CHALLENGER_SYSTEM_PROMPT = """
 You are an expert teaching who writes challenging questions for a student to solve.
 You are given a document and a url as the starting point, and you will have access to tools to help you collect more informaiton to write a challenging question.
+The student will not have access to the given document, and will need to use the tools to collect information to answer the question. Thus, do not include any explicit references the document you are given.
 
 Use the tools to collect information to write a challenging, clear, motivated, and solvable problem. Use the given document and url as a starting point. 
 For example, you may use the tools to collect more information about the topic of the document.
@@ -188,10 +106,10 @@ Write your final output in the json format:
     "explanation": "The explanation of the problem and what document sources were used to answer the question",
 }
 ```
-""".strip() + GPT_OSS_TOOL_DESC
+""".strip()
 
 
-GPT_OSS_SOLVER_SYSTEM_PROMPT = """
+SOLVER_SYSTEM_PROMPT = """
 You are a helpful assistant that can search the web. You are encourage to use the search tool to best answer the user's question. Use the search tool to collect useful information.
 When using the search tool, you should think carefully about the problem. Decompose and rewrite the search query if necessary. After using the search tool, you should reason about the results and summarize the relevant information to answer the problem. If the search results are not relevant, you are encouraged to refine your search query and search again. Continue to use the tools until you have collected all the information you need, this may take many iterations.
 The search tool will return a list of documents, and you should visit the documents relevant to the problem.
@@ -204,7 +122,7 @@ Write your final output in the json format:
     "explanation": "The explanation of the problem and what document sources were used to answer the problem",
 }
 ```
-""".strip() + GPT_OSS_TOOL_DESC
+""".strip()
 
 
 GRADER_TEMPLATE = """
@@ -350,6 +268,7 @@ class SPEnv(Env):
         player_id: int,
         coordinator: SPCoordinator,
         self_play: bool = True,
+        problem: dict | None = None,
         opponent_policy: TinkerMessageCompleter | None = None, # fixed policy when not doing self-play
         convo_prefix: list[renderers.Message] | None = None,
         max_trajectory_tokens: int = 32 * 1024,
@@ -367,10 +286,16 @@ class SPEnv(Env):
         assert self.self_play == (self.opponent_policy is None), (
             "If self_play is True, opponent_policy must be None"
         )
-        assert 0 <= player_id <= coordinator.num_solvers, f"Invalid player id: {player_id}, expect at most {coordinator.num_solvers} solvers"
+        if self.coordinator is not None:
+            assert 0 <= player_id <= coordinator.num_solvers, f"Invalid player id: {player_id}, expect at most {coordinator.num_solvers} solvers"
+            self.cid = coordinator.id
+        else:
+            assert problem is not None, "Problem is required when coordinator is None"
+            self.cid = hashlib.sha256(problem["question"].encode()).hexdigest()[:8]
 
         self.document: str = document
         self.url: str = url
+        self.problem: dict | None = problem
         self.search_tool: WebSearchTool = search_tool
         self.max_trajectory_tokens: int = max_trajectory_tokens
         self.past_messages: list[renderers.Message] = convo_prefix.copy() if convo_prefix else []
@@ -380,45 +305,50 @@ class SPEnv(Env):
         self.difficulty_reward_mode: Literal["variance", "linear", "none"] = difficulty_reward_mode
         self.tool_reward_mode: Literal["max", "mean", "none"] = tool_reward_mode
 
+
     @property
     def stop_condition(self) -> StopCondition:
         return self.renderer.get_stop_sequences()
 
 
     async def wait_for_turn(self) -> None:
-        if not self.coordinator.game_done:
+        if self.coordinator is not None and not self.coordinator.game_done:
             if self.self_play:
                 role = "Challenger" if self.player_id == 0 else f"Solver {self.player_id}"
-                logger.debug(f"{self.coordinator.id} {role} waiting for turn (phase: {self.coordinator.current_phase})")
+                logger.debug(f"{self.cid} {role} waiting for turn (phase: {self.coordinator.current_phase})")
                 await self.coordinator.wait_across_env(self.player_id)
-                logger.debug(f"{self.coordinator.id} {role} turn acquired")
+                logger.debug(f"{self.cid} {role} turn acquired")
             else:
                 raise ValueError("Not implemented: opponent policy not supported when not doing self-play")
                 # self.opponent_policy(self.past_messages)
         else:
-            logger.debug(f"{self.coordinator.id} Coordinator game is done, no need to wait for turn")
+            logger.debug(f"{self.cid} Coordinator game is done, no need to wait for turn")
 
 
     async def initial_observation(self) -> tuple[Observation, StopCondition]:
         if self.player_id == 0:
-            # logger.info(f"{self.coordinator.id} Challenger starting to make problem")
-            logger.debug(f"{self.coordinator.id} {self.player_id} making problem")
-            logtree.log_text(f"{self.coordinator.id} Challenger {self.player_id} starting to make problem")
+            logger.debug(f"{self.cid} {self.player_id} making problem")
+            logtree.log_text(f"{self.cid} Challenger {self.player_id} starting to make problem")
             convo = self.convo_prefix + [
                 {"role": "user", "content": f"Document: {self.document}\nUrl: {self.url}"},
             ]
         else:
-            logger.debug(f"{self.coordinator.id} {self.player_id} init wait")
             await self.wait_for_turn()
-            logger.debug(f"{self.coordinator.id} {self.player_id} init wait done")
-            problem_summary = str(self.coordinator.problem)[:100] + "..." if self.coordinator.problem else "None"
-            # logger.info(f"{self.coordinator.id} Solver {self.player_id} starting to solve problem")
-            logtree.log_text(f"{self.coordinator.id} Solver {self.player_id} waiting for turn completed, starting to solve {self.coordinator.problem}")
-            if self.coordinator.problem is None:
+
+            if self.coordinator is not None:
+                problem = self.coordinator.problem
+                self.problem = problem
+            else:
+                problem = self.problem
+
+            problem_summary = str(problem)[:100] + "..." if problem else "None"
+            logtree.log_text(f"{self.cid} Solver {self.player_id} waiting for turn completed, starting to solve {problem}")
+            if problem is None:
                 # can replace with a oracle sampler later
-                raise ValueError("No problem found in coordinator")
+                raise ValueError("No problem found in coordinator or problem")
+
             convo = self.convo_prefix + [
-                {"role": "user", "content": self.coordinator.problem["question"]},
+                {"role": "user", "content": problem["question"]},
             ]
         
         self.past_messages = convo.copy()
@@ -447,15 +377,17 @@ class SPEnv(Env):
         query_list = json.loads(tool_call.function.arguments)["query_list"]
         async with _CONNECTION_SEMAPHORE:
             search_results = await self.search_tool.batch_search(query_list)
+            logtree.log_text(f"Search results: {search_results[:200]}...")
             return [renderers.Message(role="tool", name="search", content=search_results)]
 
     
     async def call_browse_tool(self, tool_call: renderers.ToolCall) -> list[renderers.Message]:
         args = json.loads(tool_call.function.arguments)
-        id_list = args["id_list"]
+        id_list = args["id_list"] if self.search_tool.vector_search else args["url_list"]
         query_list = args.get("query_list", None)
         async with _CONNECTION_SEMAPHORE:
             browse_results = await self.search_tool.batch_browse(id_list, query_list)
+            logtree.log_text(f"Browse results: {browse_results[:200]}...")
             return [renderers.Message(role="tool", name="visit", content=browse_results)]
 
 
@@ -494,6 +426,7 @@ class SPEnv(Env):
         )
 
     def handle_error(self, message: str | None = None) -> StepResult:
+        logtree.log_text(f"Handling error: {message}")
         if self.handling_mode == "raise":
             raise ValueError(message)
         elif self.handling_mode == "return":
@@ -512,19 +445,21 @@ class SPEnv(Env):
             return self.handle_error("No tool calls found in the previous message.")
         
         logtree.log_text(f"Tool calls invoked.")
+        # logger.info(f"Invoked, current num calls: {self.current_num_calls}")
         tool_call = tool_calls[0]
         if tool_call.function.name == "search":
             # check for tool call validity
             logtree.log_text(f"Search tool called: {tool_call.function.arguments}")
-            self.current_num_calls += 1
-            if self.current_num_calls > self.max_num_calls:
+            if self.current_num_calls >= self.max_num_calls:
                 tool_return_message = [renderers.Message(role="tool", name="search", content="Error calling search tool: Max number of calls reached, please complete the task without using any more tools.")]
                 self.past_messages.extend(tool_return_message)
             
             elif "query_list" not in tool_call.function.arguments:
+                self.current_num_calls += 1
                 return self.handle_error(f"Query list not found in tool calls: {tool_call.function.arguments}\nMake sure to include a query_list argument when using the search tool.")
             
             else:
+                self.current_num_calls += 1
                 try:
                     tool_return_message = await self.call_search_tool(tool_call)
                     self.past_messages.extend(tool_return_message)
@@ -536,21 +471,22 @@ class SPEnv(Env):
                 return self.handle_error(f"Next observation is too long: {next_observation.length}\nMake sure to keep the observation within the maximum trajectory length.")
 
         elif tool_call.function.name == "visit":
-            logtree.log_text(f"Browse tool called: {tool_call.function.arguments}")
-            self.current_num_calls += 1
-            if self.current_num_calls > self.max_num_calls:
-                tool_return_message = [renderers.Message(role="tool", name="visit", content="Error calling browse tool: Max number of calls reached, please complete the task without using any more tools.")]
+            logtree.log_text(f"Visit tool called: {tool_call.function.arguments}")
+            if self.current_num_calls >= self.max_num_calls:
+                tool_return_message = [renderers.Message(role="tool", name="visit", content="Error calling visit tool: Max number of calls reached, please complete the task without using any more tools.")]
                 self.past_messages.extend(tool_return_message)
             
-            elif "id_list" not in tool_call.function.arguments:
-                return self.handle_error(f"Id list not found in tool calls: {tool_call.function.arguments}\nMake sure to include an id_list argument when using the browse tool.")
+            elif (self.search_tool.vector_search and "id_list" not in tool_call.function.arguments) or (not self.search_tool.vector_search and "url_list" not in tool_call.function.arguments):
+                self.current_num_calls += 1
+                return self.handle_error(f"Invalid argument in tool calls: {tool_call.function.arguments}\nMake sure to include the required arguments when using the visit tool.")
             
             else:
+                self.current_num_calls += 1
                 try:
                     tool_return_message = await self.call_browse_tool(tool_call)
                     self.past_messages.extend(tool_return_message)
                 except Exception as e:
-                    return self.handle_error(f"Error calling browse tool: {repr(e)}")
+                    return self.handle_error(f"Error calling visit tool: {repr(e)}")
 
             next_observation = self.renderer.build_generation_prompt(self.past_messages)
             if next_observation.length > self.max_trajectory_tokens:
@@ -559,6 +495,8 @@ class SPEnv(Env):
         else:
             return self.handle_error(f"Invalid tool name: {tool_call.function.name}\nMake sure to use only search or visit tools.")
 
+        if self.current_num_calls > self.max_num_calls:
+            import pdb; pdb.set_trace()
         return StepResult(
             reward=0.0,
             episode_done=False,
@@ -567,7 +505,7 @@ class SPEnv(Env):
         )
 
 
-    async def challenger_final_step(self, message: renderers.Message, correct_format: bool) -> StepResult:
+    async def challenger_final_step(self, content: str, correct_format: bool) -> StepResult:
         # correct format = json format is valid
         format_reward = 0.0
         difficulty_reward = 0.0
@@ -576,7 +514,7 @@ class SPEnv(Env):
         tool_use = None
         
         if correct_format:
-            output = self._extract_json(message["content"])
+            output = self._extract_json(content)
             if [x in output for x in ["question", "answer", "explanation"]]:
                 format_reward = FORMAT_REWARD
                 await self.coordinator.make_move(self.player_id, output)
@@ -607,6 +545,9 @@ class SPEnv(Env):
                     # take the mean number of tool calls among correct trajectories
                     if len(correct_tool_use) > 0:
                         tool_reward = float(np.mean(correct_tool_use) / self.max_num_calls)
+                elif self.tool_reward_mode == "min":
+                    if len(correct_tool_use) > 0:
+                        tool_reward = float(np.min(correct_tool_use) / self.max_num_calls)
                 elif self.tool_reward_mode == "none":
                     tool_reward = 0.0
                 else:
@@ -629,11 +570,11 @@ class SPEnv(Env):
             total_reward = format_reward + difficulty_reward + tool_reward
             # log the response
             logtree.log_text(f"==========Challenger Final Output==========")
-            logtree.log_text(f"Initial document: {self.document}")
-            logtree.log_text(f"Response: {message['content']}")
+            logtree.log_text(f"Initial document: {self.document[:500]}...")
+            logtree.log_text(f"Response: {content}")
             logtree.log_text(f"Format reward: {format_reward}")
             logtree.log_text(f"Difficulty reward: {difficulty_reward}")
-            logtree.log_text(f"Tool reward: {tool_reward}")
+            logtree.log_text(f"Tool reward: {tool_reward}; num calls: {self.current_num_calls}")
             logtree.log_text(f"Total reward: {total_reward}")
             logtree.log_text(f"==========Challenger End of Output==========")
             return StepResult(
@@ -651,26 +592,26 @@ class SPEnv(Env):
             
         else:
             # the solver could be waiting forever... should probably just raise the error here
-            raise ValueError(f"Invalid output: {message['content']}\nMake sure to output the final problem in the json format.")
-            return self.handle_error(f"Invalid output: {message['content']}\nMake sure to output the final problem in the json format.")
+            # raise ValueError(f"Invalid output: {content}\nMake sure to output the final problem in the json format.")
+            return self.handle_error(f"Invalid output: {content}\nMake sure to output the final problem in the json format.")
 
 
-    async def solver_final_step(self, message: renderers.Message, correct_format: bool) -> StepResult:
+    async def solver_final_step(self, content: str, correct_format: bool) -> StepResult:
         format_reward = 0.0
         correctness_reward = 0.0
         tool_reward = 0.0
 
         if correct_format:
-            output = self._extract_json(message["content"])
+            output = self._extract_json(content)
             if "answer" in output and "explanation" in output:
                 format_reward = FORMAT_REWARD
                 grading_response = litellm.completion(
                     model="openai/gpt-4.1-2025-04-14", 
                     messages=[{
                         "role": "user", "content": GRADER_TEMPLATE.format(
-                            question=self.coordinator.problem["question"], 
+                            question=self.problem["question"], 
                             response=output["answer"], 
-                            correct_answer=self.coordinator.problem["answer"]
+                            correct_answer=self.problem["answer"]
                         )
                     }]
                 )
@@ -681,9 +622,10 @@ class SPEnv(Env):
                     correctness_reward = 1.0
                     tool_reward = (self.max_num_calls - self.current_num_calls) / self.max_num_calls
                 # need to give the tool usage too
-                await self.coordinator.make_move(self.player_id, (correct, self.current_num_calls))
+                if self.coordinator is not None:
+                    await self.coordinator.make_move(self.player_id, (correct, self.current_num_calls))
 
-            else:
+            elif self.coordinator is not None:
                 # still need to make a move to signal the solver is done
                 await self.coordinator.make_move(self.player_id, (False, self.current_num_calls))
             
@@ -691,11 +633,11 @@ class SPEnv(Env):
             
             # log the response
             logtree.log_text(f"==========Solver {self.player_id} Final Output==========")
-            logtree.log_text(f"Problem: {self.coordinator.problem}")
-            logtree.log_text(f"Response: {message['content']}")
+            logtree.log_text(f"Problem: {self.problem}")
+            logtree.log_text(f"Response: {content}")
             logtree.log_text(f"Format reward: {format_reward}")
             logtree.log_text(f"Correctness reward: {correctness_reward}")
-            logtree.log_text(f"Tool reward: {tool_reward}")
+            logtree.log_text(f"Tool reward: {tool_reward}; num calls: {self.current_num_calls}")
             logtree.log_text(f"Total reward: {total_reward}")
             logtree.log_text(f"==========Solver {self.player_id} End of Output==========")
             return StepResult(
@@ -704,6 +646,7 @@ class SPEnv(Env):
                 next_observation=tinker.ModelInput.empty(),
                 next_stop_condition=self.stop_condition,
                 metrics={
+                    "num_calls": self.current_num_calls,
                     "format_reward": format_reward,
                     "correctness_reward": correctness_reward,
                     "tool_reward": tool_reward,
@@ -711,7 +654,7 @@ class SPEnv(Env):
             )
 
         else:
-            return self.handle_error(f"Invalid output: {message['content']}\nMake sure to output the final answer and explanation in the json format.")
+            return self.handle_error(f"Invalid output: {content}\nMake sure to output the final answer and explanation in the json format.")
 
 
     async def step(self, action: Action) -> StepResult:
@@ -727,27 +670,23 @@ class SPEnv(Env):
 
         else:
             # challenger and solve share different logic here
-            correct_format = float(parse_success) and float(self.check_format(message["content"]))
-            logger.debug(f"{self.coordinator.id} {self.player_id} final step")
+            # the message is a list with different types (thinking vs. text), we only care about the text message
+            content = get_text_content(message)
+            correct_format = float(parse_success) and float(self.check_format(content))
+            logger.debug(f"{self.cid} {self.player_id} final step")
 
             if self.player_id == 0:            
-                return await self.challenger_final_step(message, correct_format)
+                return await self.challenger_final_step(content, correct_format)
             else:
-                return await self.solver_final_step(message, correct_format)
+                return await self.solver_final_step(content, correct_format)
                 
 
     @staticmethod
-    def standard_fewshot_prefix(player_id: int) -> list[renderers.Message]:
-        if player_id == 0:
-            return [{"role": "developer", "content": GPT_OSS_CHALLENGER_SYSTEM_PROMPT},]
-        else:
-            return [{"role": "developer", "content": GPT_OSS_SOLVER_SYSTEM_PROMPT},]
-            # {
-            #     "role": "system",
-            #     "content": CHALLENGER_SYSTEM_PROMPT,
-            # },
-
-            # for gpt oss, the tool definitions are in the developer message
+    def standard_fewshot_prefix(renderer: renderers.Renderer, search_tool: WebSearchTool, player_id: int) -> list[renderers.Message]:
+        return renderer.create_conversation_prefix_with_tools(
+            tools=search_tool.get_tool_schemas(),
+            system_prompt=CHALLENGER_SYSTEM_PROMPT if player_id == 0 else SOLVER_SYSTEM_PROMPT,
+        )
 
 
 
@@ -763,6 +702,40 @@ def load_fineweb_dataset(split: Literal["train", "test"]) -> list[FinewebDatum]:
     return [{"document": item["text"], "url": item["url"]} for item in fw]
 
 
+class QADatum(TypedDict):
+    question: str
+    answer: str
+
+def load_qa_dataset(split: str) -> list[QADatum]:
+    path = "/home/hyen/project/simple-evals/data/browse_comp_test_set_heldout.csv"
+
+    # TODO: move this to a utils file later
+    import base64
+    import hashlib
+    def derive_key(password: str, length: int) -> bytes:
+        """Derive a fixed-length key from the password using SHA256."""
+        hasher = hashlib.sha256()
+        hasher.update(password.encode())
+        key = hasher.digest()
+        return key * (length // len(key)) + key[: length % len(key)]
+
+    def decrypt(ciphertext_b64: str, password: str) -> str:
+        """Decrypt base64-encoded ciphertext with XOR."""
+        encrypted = base64.b64decode(ciphertext_b64)
+        key = derive_key(password, len(encrypted))
+        decrypted = bytes(a ^ b for a, b in zip(encrypted, key))
+        return decrypted.decode()
+
+    df = pd.read_csv(path)
+    qa = []
+    for _, row in df.iterrows():
+        problem = decrypt(row.get("problem", ""), row.get("canary", ""))
+        answer = decrypt(row.get("answer", ""), row.get("canary", ""))
+        qa.append({"question": problem, "answer": answer})
+
+    return qa
+
+
 @dataclass(frozen=True)
 class SPGroupBuilder(ProblemGroupBuilder):
     env_thunk: Callable[[], ProblemEnv]
@@ -776,7 +749,7 @@ class SPGroupBuilder(ProblemGroupBuilder):
             assert isinstance(self.coordinator, list), "Challenger environments expect a list of different coordinators"
             return [self.env_thunk(player_id=0, coordinator=self.coordinator[i]) for i in range(self.num_envs)]
         else:
-            assert isinstance(self.coordinator, SPCoordinator), "Solver environments expect a single coordinator"
+            # assert isinstance(self.coordinator, SPCoordinator), "Solver environments expect a single coordinator"
             return [self.env_thunk(player_id=i+1, coordinator=self.coordinator) for i in range(self.num_envs)]
 
 
@@ -808,7 +781,12 @@ class SPDataset(RLDataset):
         self.search_tool: WebSearchTool = search_tool
         self.seed: int = seed
         self.split: Literal["train", "test"] = split
-        self.ds: list[FinewebDatum] = load_fineweb_dataset(split)
+
+        if split == "train":
+            self.ds: list[FinewebDatum] = load_fineweb_dataset(split)
+        else:
+            self.ds: list[QADatum] = load_qa_dataset(split)
+
         self.self_play: bool = self_play
         self.handling_mode: Literal["raise", "return", "continue"] = handling_mode
         self.difficulty_reward_mode: Literal["variance", "linear", "none"] = difficulty_reward_mode
@@ -826,7 +804,7 @@ class SPDataset(RLDataset):
         # Each challenger environment will have group_size solver environments
         # Thus, each row will result in group_size challenger environments and group_size*group_size solver environments
 
-        if self.self_play:
+        if self.self_play and self.split == "train":
             # each challenger and its set of group_size solver environments will share the same coordinator
             batches = []
             for idx, row in enumerate(self.ds[index * self.batch_size : (index + 1) * self.batch_size]):
@@ -836,6 +814,11 @@ class SPDataset(RLDataset):
                 solver_envs = [self._make_solver_env_group_builder(row, self.group_size, coordinator=coordinator[i]) for i in range(self.group_size)]
                 batches.extend(solver_envs)
             return batches
+
+        elif self.split == "test":
+            # just testing the challenger
+            # need some special logic for the solver groups so it doesn't wait for the challenger to make a move
+            return [self._make_solver_env_group_builder(row=None, group_size=self.group_size, coordinator=None, problem=row) for row in self.ds[index * self.batch_size : (index + 1) * self.batch_size]]
         
         else:        
             # just training the challenger
@@ -857,7 +840,7 @@ class SPDataset(RLDataset):
                 row["url"],
                 self.search_tool,
                 self.renderer,
-                convo_prefix=SPEnv.standard_fewshot_prefix(0),
+                convo_prefix=SPEnv.standard_fewshot_prefix(self.renderer, self.search_tool, 0),
                 max_trajectory_tokens=self.max_trajectory_tokens,
                 max_num_calls=self.max_num_calls,
                 self_play=self.self_play,
@@ -868,7 +851,7 @@ class SPDataset(RLDataset):
             num_envs=group_size,
         )
 
-    def _make_solver_env_group_builder(self, row: FinewebDatum, group_size: int, coordinator: SPCoordinator | None = None) -> SPGroupBuilder:
+    def _make_solver_env_group_builder(self, row: FinewebDatum, group_size: int, coordinator: SPCoordinator | None = None, problem: dict | None = None) -> SPGroupBuilder:
         # solver gets a special group builder because it also needs to pass in the player id
         return SPGroupBuilder(
             phase="solver",
@@ -879,7 +862,26 @@ class SPDataset(RLDataset):
                 row["url"],
                 self.search_tool,
                 self.renderer,
-                convo_prefix=SPEnv.standard_fewshot_prefix(1),
+                convo_prefix=SPEnv.standard_fewshot_prefix(self.renderer, self.search_tool, 1),
+                max_trajectory_tokens=self.max_trajectory_tokens,
+                max_num_calls=self.max_num_calls,
+                self_play=self.self_play,
+                handling_mode=self.handling_mode,
+                difficulty_reward_mode=self.difficulty_reward_mode,
+                tool_reward_mode=self.tool_reward_mode,
+            ),
+            num_envs=group_size,
+        ) if problem is None else SPGroupBuilder(
+            phase="solver",
+            coordinator=coordinator,
+            env_thunk=partial(
+                SPEnv,
+                None,
+                None,
+                self.search_tool,
+                self.renderer,
+                problem=problem,
+                convo_prefix=SPEnv.standard_fewshot_prefix(self.renderer, self.search_tool, 1),
                 max_trajectory_tokens=self.max_trajectory_tokens,
                 max_num_calls=self.max_num_calls,
                 self_play=self.self_play,
@@ -895,6 +897,8 @@ class SPDataset(RLDataset):
 class SPDatasetBuilder(RLDatasetBuilder):
     batch_size: int
     group_size: int
+    eval_group_size: int
+    eval_max_num_calls: int = 25
     handling_mode: Literal["raise", "return", "continue"] = "raise"
     difficulty_reward_mode: Literal["variance", "linear", "none"] = "variance"
     tool_reward_mode: Literal["max", "mean", "none"] = "max"
@@ -928,7 +932,6 @@ class SPDatasetBuilder(RLDatasetBuilder):
             group_size=self.group_size,
             renderer=renderer,
             search_tool=search_tool,
-            # convo_prefix=convo_prefix,
             split="train",
             seed=self.seed,
             max_trajectory_tokens=self.max_trajectory_tokens,
@@ -938,4 +941,23 @@ class SPDatasetBuilder(RLDatasetBuilder):
             difficulty_reward_mode=self.difficulty_reward_mode,
             tool_reward_mode=self.tool_reward_mode,
         )
-        return (train_dataset, None)
+
+        # now we make the eval dataset, but we are only going evaluate the solver
+        # instead of using questions generated by the challenger, we are just gonna load them from another dataset with qa pairs already
+        # this also means that we need to change the some of the logic in the SPEnv
+        eval_dataset = SPDataset(
+            batch_size=self.batch_size,
+            group_size=self.eval_group_size,
+            renderer=renderer,
+            search_tool=search_tool,
+            split="test",
+            seed=self.seed,
+            max_trajectory_tokens=self.max_trajectory_tokens,
+            max_num_calls=self.eval_max_num_calls,
+            subset_size=self.max_eval_size,
+            handling_mode=self.handling_mode,
+            difficulty_reward_mode=self.difficulty_reward_mode,
+            tool_reward_mode=self.tool_reward_mode,
+        )
+        
+        return (train_dataset, eval_dataset)

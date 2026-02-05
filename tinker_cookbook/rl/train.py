@@ -339,18 +339,16 @@ async def run_evaluations_parallel(
 ) -> dict[str, Any]:
     """Run all evaluators in parallel and return aggregated metrics."""
 
-    # Create tasks for all evaluators with names for better traceability
-    tasks = []
-    for i, evaluator in enumerate(evaluators):
-        ev_name = _get_evaluator_name(evaluator)
-        task = asyncio.create_task(
-            run_single_evaluation(evaluator, cfg, i_batch, sampling_client),
-            name=f"eval_{ev_name or i}_iteration_{i_batch:06d}",
-        )
-        tasks.append(task)
+    # Create coroutines for all evaluators
+    coroutines = [
+        run_single_evaluation(evaluator, cfg, i_batch, sampling_client)
+        for evaluator in evaluators
+    ]
 
-    # Wait for all to complete
-    results = await asyncio.gather(*tasks)
+    # Wait for all to complete with progress bar
+    results = await gather_with_progress(
+        coroutines, desc=f"Running {len(evaluators)} evaluator(s) (batch {i_batch})"
+    )
 
     # Merge all metrics
     metrics = {}

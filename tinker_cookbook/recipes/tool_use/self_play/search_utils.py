@@ -8,68 +8,101 @@ import aiohttp
 import chz
 
 from tinker_cookbook.renderers import ToolCall, Message
+from tinker_cookbook.renderers.base import ToolSpec
 
 logger = logging.getLogger(__name__)
 
-SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "search",
-        "description": "Search the web for relevant information with the queries. This tool will return a list of urls with a snippet of the content in the url for each query.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query_list": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "A list of fully-formed semantic queries. This tool will return search results for each query.",
-                },
-            },
-            "required": [
-                "query_list",
-            ],
-            "additionalProperties": False
+
+WEB_SEARCH_TOOL: ToolSpec = {
+    "name": "search",
+    "description": "Search the web for relevant information with the queries. Returns a list of urls with a snippet of the content in the url for each query.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query_list": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Search queries given to the search engine.",
+            }
         },
-        "outputSchema": {
-            "type": "string",
-            "description": "The search results in JSON format",
-        },
+        "required": ["query_list"],
     }
 }
 
-BROWSE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "browse",
-        "description": "Browse the urls. This tool will return a snippet of the content in each url. Optionally, you can search for a specific query in each url, and the tool will perform fuzzy matching to find the part of the page that contains the highest textual similarity to the query.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "url_list": {
-                    "type": "string",
-                    "description": "A list of urls to browse. The tool will return a snippet of the content in each url.",
-                },
-                "query_list": {
-                    "type": "string",
-                    "description": "A list of queries to search for in each url. The tool will perform fuzzy matching to find the part of the page that contains the highest textual similarity to the query. If given an empty query, the tool will return the beginning of the page.",
-                }
-            },
-            "required": [
-                "url_list",
-            ],
-            "additionalProperties": False
+VECTOR_SEARCH_TOOL: ToolSpec = {
+    "name": "search",
+    "description": "Search for relevant information with the queries. For each query, this returns a list of ids, where each id corresponds to a document, and a snippet from each document.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query_list": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "A list of fully-formed semantic queries. This tool will return search results for each query.",
+            }
         },
-        "outputSchema": {
-            "type": "string",
-            "description": "The browse results in JSON format",
-        },
+        "required": ["query_list"],
     }
+}
+
+WEB_VISIT_TOOL: ToolSpec = {
+    "name": "visit",
+    "description": "Browse the web pages by their urls. This returns the text content of the web page, with at most 10000 characters. Optionally, you can search for a specific query in each url, and the tool will perform fuzzy matching to find the part of the page that contains the highest textual similarity to the query.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url_list": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "A list of urls to browse. This tool will return the text content of each page.",
+            },
+            "query_list": {
+                "type": "array",
+                "items": {"type": "string"},
+                "nullable": True,
+                "description": "A list of queries to search for in each url. The tool will perform fuzzy matching to find the part of the page that contains the highest textual similarity to the query. If given an empty query, the tool will return the beginning of the page.",
+            }
+        },
+        "required": ["url_list"],
+        "additionalProperties": False
+    },
+    "outputSchema": {
+        "type": "string",
+        "description": "The browse results in JSON format",
+    },
+}
+
+VECTOR_VISIT_TOOL: ToolSpec = {
+    "name": "visit",
+    "description": "Browse the documents by their ids. This returns the text content of the document, with at most 10000 characters. Optionally, you can search for a specific query in each document, and the tool will perform fuzzy matching to find the part of the document that contains the highest textual similarity to the query.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id_list": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "A list of document ids to browse. This tool will return the text content of each document.",
+            },
+            "query_list": {
+                "type": "array",
+                "nullable": True,
+                "items": {"type": "string"},
+                "description": "A list of queries to search for in each document. The tool will perform fuzzy matching to find the part of the document that contains the highest textual similarity to the query. If given an empty query, the tool will return the beginning of the document.",
+            }
+        },
+        "required": ["id_list"],
+        "additionalProperties": False
+    },
+    "outputSchema": {
+        "type": "string",
+        "description": "The browse results in JSON format",
+    },
 }
 
 
 class ToolClientInterface(ABC):
     @abstractmethod
-    def get_tool_schemas(self) -> list[dict[str, Any]]: ...
+    def get_tool_schemas(self) -> list[ToolSpec]: ...
 
     @abstractmethod
     async def invoke(self, tool_call: ToolCall) -> list[Message]: ...
@@ -83,6 +116,7 @@ class WebSearchToolConfig:
     scoring_func: str = "rouge"
     chunking_func: str = "newline"
     timeout: float = 300.0  # Timeout in seconds (default 5 minutes)
+    vector_search: bool = False
 
 
 class WebSearchTool(ToolClientInterface):
@@ -92,11 +126,12 @@ class WebSearchTool(ToolClientInterface):
         self.content_length = config.content_length
         self.scoring_func = config.scoring_func
         self.chunking_func = config.chunking_func
+        self.vector_search = config.vector_search
         self.timeout = aiohttp.ClientTimeout(total=config.timeout)
 
 
-    def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return [SEARCH_TOOL, BROWSE_TOOL]
+    def get_tool_schemas(self) -> list[ToolSpec]:
+        return [WEB_SEARCH_TOOL, WEB_VISIT_TOOL] if not self.vector_search else [VECTOR_SEARCH_TOOL, VECTOR_VISIT_TOOL]
 
 
     async def batch_search(self, query_list: list[str]) -> str:
