@@ -31,7 +31,7 @@ WEB_SEARCH_TOOL: ToolSpec = {
 
 VECTOR_SEARCH_TOOL: ToolSpec = {
     "name": "search",
-    "description": "Search for relevant information with the queries. For each query, this returns a list of ids, where each id corresponds to a document, and a snippet from each document.",
+    "description": "Search the web for relevant information with the queries. Returns a list of urls with a snippet of the content in the url for each query.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -74,23 +74,23 @@ WEB_VISIT_TOOL: ToolSpec = {
 
 VECTOR_VISIT_TOOL: ToolSpec = {
     "name": "visit",
-    "description": "Browse the documents by their ids. This returns the text content of the document, with at most 10000 characters. Optionally, you can search for a specific query in each document, and the tool will perform fuzzy matching to find the part of the document that contains the highest textual similarity to the query.",
+    "description": "Browse the web pages by their urls. The available urls are limited to the ones returned by the search tool. Make sure to use the exact url from the search tool or it will not be available. This returns the text content of the web page, with at most 10000 characters. Optionally, you can search for a specific query in each url, and the tool will perform fuzzy matching to find the part of the page that contains the highest textual similarity to the query.",
     "parameters": {
         "type": "object",
         "properties": {
-            "id_list": {
+            "url_list": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "A list of document ids to browse. This tool will return the text content of each document.",
+                "description": "A list of urls to browse. This tool will return the text content of each page.",
             },
             "query_list": {
                 "type": "array",
                 "nullable": True,
                 "items": {"type": "string"},
-                "description": "A list of queries to search for in each document. The tool will perform fuzzy matching to find the part of the document that contains the highest textual similarity to the query. If given an empty query, the tool will return the beginning of the document.",
+                "description": "A list of queries to search for in each url. The tool will perform fuzzy matching to find the part of the page that contains the highest textual similarity to the query. If given an empty query, the tool will return the beginning of the page.",
             }
         },
-        "required": ["id_list"],
+        "required": ["url_list"],
         "additionalProperties": False
     },
     "outputSchema": {

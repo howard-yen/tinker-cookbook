@@ -699,7 +699,7 @@ async def do_async_training(
             # while we're running the evals
             sampling_client_eval_step = sampling_client_step
             sampling_client_eval = sampling_client
-            if cfg.eval_every > 0 and sampling_client_eval_step % cfg.eval_every == 0:
+            if cfg.eval_every > 0 and sampling_client_eval_step % cfg.eval_every == 0 and sampling_client_eval_step > 0:
                 with timed("run_evals", metrics):
                     for evaluator in evaluators:
                         eval_metrics = await evaluator(sampling_client_eval)

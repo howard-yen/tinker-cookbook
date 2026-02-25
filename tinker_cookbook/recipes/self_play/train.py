@@ -9,8 +9,8 @@ from typing import Literal
 
 import chz
 from tinker_cookbook import cli_utils, model_info
-from tinker_cookbook.recipes.tool_use.self_play.search_env import SPDatasetBuilder
-from tinker_cookbook.recipes.tool_use.self_play.search_utils import WebSearchToolConfig
+from tinker_cookbook.recipes.self_play.search_env import SPDatasetBuilder
+from tinker_cookbook.recipes.self_play.search_utils import WebSearchToolConfig
 from tinker_cookbook.rl import train
 from tinker.types import LossFnType
 
@@ -39,6 +39,8 @@ class CLIConfig:
     max_num_calls: int = 4
     n_batches: int | None = None  # If set, limits the number of training batches
     eval_n_batches: int = 100 # this should always be set to control number of eval baatches
+    train_split: Literal["fineweb", "bcplus"] = "fineweb"
+    eval_split: Literal["browsecomp", "browsecomp_plus", "dsqa"] = "browsecomp"
 
     # Self-play parameters
     self_play: bool = True
@@ -90,12 +92,15 @@ async def cli_main(cli_config: CLIConfig):
         batch_size=cli_config.batch_size,
         group_size=cli_config.group_size,
         eval_group_size=cli_config.eval_group_size,
+        train_split=cli_config.train_split,
+        eval_split=cli_config.eval_split,
         renderer_name=renderer_name,
         model_name_for_tokenizer=cli_config.model_name,
         search_tool_config=web_tool_config,
         seed=cli_config.seed,
         max_trajectory_tokens=cli_config.max_trajectory_tokens,
         max_num_calls=cli_config.max_num_calls,
+        max_tokens=cli_config.max_tokens,
         eval_max_num_calls=cli_config.eval_max_num_calls,
         n_batches=cli_config.n_batches,
         max_eval_size=cli_config.eval_n_batches,
@@ -124,8 +129,7 @@ async def cli_main(cli_config: CLIConfig):
     if cli_config.log_path is not None:
         log_path = cli_config.log_path
     else:
-        log_path = f"/tmp/tinker-examples/rl_self_play/{run_name}"
-        log_path = f"logs/{run_name}"
+        log_path = f"/tmp/tinker/self_play/train_logs/{run_name}"
 
     if cli_config.wandb_name is not None:
         wandb_name = f"{cli_config.wandb_name}_{cli_config.run_tag}" if cli_config.run_tag else cli_config.wandb_name

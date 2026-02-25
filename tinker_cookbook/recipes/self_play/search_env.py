@@ -3,17 +3,14 @@ import logging
 import os
 import random
 import re
-import string
 import json
 import hashlib
-from functools import partial, reduce
-from pathlib import Path
-from typing import Literal, Sequence, TypedDict, cast, Callable, List
+from functools import partial
+from typing import Literal, Sequence, Callable, List
 from dataclasses import dataclass
 
 import chz
 import numpy as np
-import pandas as pd
 import litellm
 import tinker
 from tinker_cookbook import renderers
@@ -31,43 +28,20 @@ from tinker_cookbook.rl.types import (
 from tinker_cookbook.renderers.base import get_text_content
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.utils import logtree
-from tinker_cookbook.recipes.tool_use.self_play.search_utils import WebSearchTool, WebSearchToolConfig
+from tinker_cookbook.recipes.self_play.search_utils import WebSearchTool, WebSearchToolConfig
+from tinker_cookbook.recipes.self_play.utils import grade_answer, SeedDatum, load_seed_dataset, QADatum, load_qa_dataset
 
-
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 # Suppress LiteLLM INFO messages
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
+# Use force=True so this takes effect even if another library already called basicConfig
+logging.basicConfig(level=int(os.getenv("LOG_LEVEL", logging.INFO)), format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+logger = logging.getLogger(__name__)
+
 _CONNECTION_SEMAPHORE = asyncio.Semaphore(128)
 
 FORMAT_REWARD = 0.5
-
-
-GPT_OSS_TOOL_DESC = """
-# Tools
-
-## functions
-
-namespace functions {
-
-// Search the web for relevant information with the queries. This tool will return a list of ids with a snippet from each document for each query.
-type search = (_: {
-// A list of queries to search the web for.
-query_list: string[],
-}) => any;
-
-// Visit the documents by their ids. This tool will return a snippet of the content in each document. Optionally, you can search for a specific query in each document, and the tool will perform fuzzy matching to find the part of the page that contains the highest textual similarity to the query.",
-type visit = (_: {
-// A list of document ids to browse. The tool will return the content in each document.
-id_list: string[],
-// A list of queries to search for in each document. The tool will perform fuzzy matching to find the part of the document that contains the highest textual similarity to the query.
-query_list?: string[] | null,
-}) => any;
-
-} // namespace functions
-""".strip()
 
 
 CHALLENGER_FALLBACK_SYSTEM_PROMPT = """
@@ -125,51 +99,6 @@ Write your final output in the json format:
 """.strip()
 
 
-GRADER_TEMPLATE = """
-Judge whether the following [response] to [question] is correct or not based on the precise and unambiguous [correct_answer] below.
-
-[question]: {question}
-
-[response]: {response}
-
-Your judgement must be in the format and criteria specified below:
-
-extracted_final_answer: The final exact answer extracted from the [response]. Put the extracted answer as 'None' if there is no exact, final answer to extract from the response.
-
-[correct_answer]: {correct_answer}
-
-reasoning: Explain why the extracted_final_answer is correct or incorrect based on [correct_answer], focusing only on if there are meaningful differences between [correct_answer] and the extracted_final_answer. Do not comment on any background to the problem, do not attempt to solve the problem, do not argue for any answer different than [correct_answer], focus only on whether the answers match.
-
-correct: Answer 'yes' if extracted_final_answer matches the [correct_answer] given above, or is within a small margin of error for numerical problems. Answer 'no' otherwise, i.e. if there if there is any inconsistency, ambiguity, non-equivalency, or if the extracted answer is incorrect.
-
-
-confidence: The extracted confidence score between 0|\\%| and 100|\\%| from [response]. Put 100 if there is no confidence score available.
-""".strip()
-
-
-# TODO: should add some example problems 
-DEMONSTRATION=""""""
-
-
-def normalize_answer(s: str) -> str:
-    """Normalize answer by lowercasing, removing punctuation, articles, and fixing whitespace."""
-
-    def remove_articles(text: str) -> str:
-        return re.sub(r"\b(a|an|the)\b", " ", text)
-
-    def white_space_fix(text: str) -> str:
-        return " ".join(text.split())
-
-    def remove_punc(text: str) -> str:
-        exclude = set(string.punctuation)
-        return "".join(ch for ch in text if ch not in exclude)
-
-    def lower(text: str) -> str:
-        return text.lower()
-
-    # Apply transformations in order using reduce
-    transformations = [lower, remove_punc, remove_articles, white_space_fix]
-    return reduce(lambda text, func: func(text), transformations, s)
 
 
 class SPCoordinator:
@@ -272,6 +201,7 @@ class SPEnv(Env):
         opponent_policy: TinkerMessageCompleter | None = None, # fixed policy when not doing self-play
         convo_prefix: list[renderers.Message] | None = None,
         max_trajectory_tokens: int = 32 * 1024,
+        max_tokens: int = 1024,
         max_num_calls: int = 4,
         handling_mode: Literal["raise", "return", "continue"] = "raise",
         difficulty_reward_mode: Literal["variance", "linear", "none"] = "variance",
@@ -301,6 +231,7 @@ class SPEnv(Env):
         self.past_messages: list[renderers.Message] = convo_prefix.copy() if convo_prefix else []
         self.current_num_calls: int = 0
         self.max_num_calls: int = max_num_calls
+        self.max_tokens: int = max_tokens
         self.handling_mode: Literal["raise", "return", "continue"] = handling_mode
         self.difficulty_reward_mode: Literal["variance", "linear", "none"] = difficulty_reward_mode
         self.tool_reward_mode: Literal["max", "mean", "none"] = tool_reward_mode
@@ -335,6 +266,7 @@ class SPEnv(Env):
         else:
             await self.wait_for_turn()
 
+            logger.debug(f"{self.cid} Solver {self.player_id} waiting for turn")
             if self.coordinator is not None:
                 problem = self.coordinator.problem
                 self.problem = problem
@@ -343,6 +275,7 @@ class SPEnv(Env):
 
             problem_summary = str(problem)[:100] + "..." if problem else "None"
             logtree.log_text(f"{self.cid} Solver {self.player_id} waiting for turn completed, starting to solve {problem}")
+            logger.debug(f"{self.cid} Solver {self.player_id} waiting for turn completed, starting to solve {problem}")
             if problem is None:
                 # can replace with a oracle sampler later
                 raise ValueError("No problem found in coordinator or problem")
@@ -377,36 +310,18 @@ class SPEnv(Env):
         query_list = json.loads(tool_call.function.arguments)["query_list"]
         async with _CONNECTION_SEMAPHORE:
             search_results = await self.search_tool.batch_search(query_list)
-            logtree.log_text(f"Search results: {search_results[:200]}...")
+            logtree.log_text(f"Search results: {search_results}")
             return [renderers.Message(role="tool", name="search", content=search_results)]
 
     
     async def call_browse_tool(self, tool_call: renderers.ToolCall) -> list[renderers.Message]:
         args = json.loads(tool_call.function.arguments)
-        id_list = args["id_list"] if self.search_tool.vector_search else args["url_list"]
+        url_list = args["url_list"]
         query_list = args.get("query_list", None)
         async with _CONNECTION_SEMAPHORE:
-            browse_results = await self.search_tool.batch_browse(id_list, query_list)
-            logtree.log_text(f"Browse results: {browse_results[:200]}...")
+            browse_results = await self.search_tool.batch_browse(url_list, query_list)
+            logtree.log_text(f"Browse results: {browse_results}")
             return [renderers.Message(role="tool", name="visit", content=browse_results)]
-
-
-    def solve(self, question: str, answer: str) -> bool:
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": question},
-        ]
-        response = litellm.completion(model="openai/o3", messages=messages, n=8)
-        responses = [r["message"]["content"] for r in response['choices']]
-
-        correctness = []
-        for response in responses:
-            grading_response = litellm.completion(model="openai/gpt-4.1-2025-04-14", messages=[{"role": "user", "content": GRADER_TEMPLATE.format(question=question, response=response, correct_answer=answer)}])
-            grading_response = grading_response['choices'][0]['message']['content']
-            correct_match = re.search(r"correct: (yes|no)", grading_response)
-            correctness_bool = correct_match.group(1) == "yes" if correct_match else False
-            correctness.append(correctness_bool)
-        return correctness
 
 
     def get_failure_results(self) -> StepResult:
@@ -425,13 +340,14 @@ class SPEnv(Env):
             next_stop_condition=self.stop_condition,
         )
 
-    def handle_error(self, message: str | None = None) -> StepResult:
-        logtree.log_text(f"Handling error: {message}")
-        if self.handling_mode == "raise":
+    def handle_error(self, message: str | None = None, override: Literal["raise", "return", "continue"] | None = None) -> StepResult:
+        logtree.log_text(f"Handling error: {message}, override: {override}")
+        mode = self.handling_mode if override is None else override
+        if mode == "raise":
             raise ValueError(message)
-        elif self.handling_mode == "return":
+        elif mode == "return":
             return self.get_failure_results()
-        elif self.handling_mode == "continue":
+        elif mode == "continue":
             assert message is not None, "Message is required when handling mode is continue"
             self.past_messages.append(renderers.Message(role="user", content=message))
             return self.get_invalid_results()
@@ -444,12 +360,9 @@ class SPEnv(Env):
             # three ways to handle: return failure_results, raise ValueError, or continue with next step with observation message
             return self.handle_error("No tool calls found in the previous message.")
         
-        logtree.log_text(f"Tool calls invoked.")
-        # logger.info(f"Invoked, current num calls: {self.current_num_calls}")
         tool_call = tool_calls[0]
         if tool_call.function.name == "search":
             # check for tool call validity
-            logtree.log_text(f"Search tool called: {tool_call.function.arguments}")
             if self.current_num_calls >= self.max_num_calls:
                 tool_return_message = [renderers.Message(role="tool", name="search", content="Error calling search tool: Max number of calls reached, please complete the task without using any more tools.")]
                 self.past_messages.extend(tool_return_message)
@@ -461,42 +374,45 @@ class SPEnv(Env):
             else:
                 self.current_num_calls += 1
                 try:
-                    tool_return_message = await self.call_search_tool(tool_call)
+                    with logtree.scope_details(f"Search tool call {self.current_num_calls}"):
+                        logtree.log_text(f"Search tool arguments: {tool_call.function.arguments}")
+                        tool_return_message = await self.call_search_tool(tool_call)
                     self.past_messages.extend(tool_return_message)
                 except Exception as e:
                     return self.handle_error(f"Error calling search tool: {repr(e)}")
 
             next_observation = self.renderer.build_generation_prompt(self.past_messages)
-            if next_observation.length > self.max_trajectory_tokens:
-                return self.handle_error(f"Next observation is too long: {next_observation.length}\nMake sure to keep the observation within the maximum trajectory length.")
+            if next_observation.length + self.max_tokens > self.max_trajectory_tokens:
+                logger.error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.")
+                return self.handle_error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.", override="return")
 
         elif tool_call.function.name == "visit":
-            logtree.log_text(f"Visit tool called: {tool_call.function.arguments}")
             if self.current_num_calls >= self.max_num_calls:
                 tool_return_message = [renderers.Message(role="tool", name="visit", content="Error calling visit tool: Max number of calls reached, please complete the task without using any more tools.")]
                 self.past_messages.extend(tool_return_message)
             
-            elif (self.search_tool.vector_search and "id_list" not in tool_call.function.arguments) or (not self.search_tool.vector_search and "url_list" not in tool_call.function.arguments):
+            elif "url_list" not in tool_call.function.arguments:
                 self.current_num_calls += 1
                 return self.handle_error(f"Invalid argument in tool calls: {tool_call.function.arguments}\nMake sure to include the required arguments when using the visit tool.")
             
             else:
                 self.current_num_calls += 1
                 try:
-                    tool_return_message = await self.call_browse_tool(tool_call)
+                    with logtree.scope_details(f"Browse tool call {self.current_num_calls}"):
+                        logtree.log_text(f"Browse tool arguments: {tool_call.function.arguments}")
+                        tool_return_message = await self.call_browse_tool(tool_call)
                     self.past_messages.extend(tool_return_message)
                 except Exception as e:
                     return self.handle_error(f"Error calling visit tool: {repr(e)}")
 
             next_observation = self.renderer.build_generation_prompt(self.past_messages)
-            if next_observation.length > self.max_trajectory_tokens:
-                return self.handle_error(f"Next observation is too long: {next_observation.length}\nMake sure to keep the observation within the maximum trajectory length.")
+            if next_observation.length + self.max_tokens > self.max_trajectory_tokens:
+                logger.error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.")
+                return self.handle_error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.", override="return")
        
         else:
             return self.handle_error(f"Invalid tool name: {tool_call.function.name}\nMake sure to use only search or visit tools.")
 
-        if self.current_num_calls > self.max_num_calls:
-            import pdb; pdb.set_trace()
         return StepResult(
             reward=0.0,
             episode_done=False,
@@ -515,8 +431,10 @@ class SPEnv(Env):
         
         if correct_format:
             output = self._extract_json(content)
-            if [x in output for x in ["question", "answer", "explanation"]]:
+            if all(x in output for x in ["question", "answer", "explanation"]):
                 format_reward = FORMAT_REWARD
+                logger.debug(f"{self.cid} Challenger {self.player_id} making move with output: {output}")
+                print(f"{self.cid} Challenger {self.player_id} making move with output: {output}")
                 await self.coordinator.make_move(self.player_id, output)
                 await self.wait_for_turn()
 
@@ -554,6 +472,8 @@ class SPEnv(Env):
                     raise ValueError(f"Invalid tool reward mode: {self.tool_reward_mode}")
 
             else:
+                logger.debug(f"{self.cid} Challenger {self.player_id} falling back to using oracle challenger")
+                print(f"{self.cid} Challenger {self.player_id} falling back to using oracle challenger")
                 # fall back to using oracle challenger, don't need to wait for the solvers
                 response = litellm.completion(
                     model="openai/gpt-4.1-2025-04-14", 
@@ -603,23 +523,13 @@ class SPEnv(Env):
 
         if correct_format:
             output = self._extract_json(content)
+            extras = {}
             if "answer" in output and "explanation" in output:
                 format_reward = FORMAT_REWARD
-                grading_response = litellm.completion(
-                    model="openai/gpt-4.1-2025-04-14", 
-                    messages=[{
-                        "role": "user", "content": GRADER_TEMPLATE.format(
-                            question=self.problem["question"], 
-                            response=output["answer"], 
-                            correct_answer=self.problem["answer"]
-                        )
-                    }]
-                )
-                grading_response = grading_response['choices'][0]['message']['content']
-                correct_match = re.search(r"correct: (yes|no)", grading_response)
-                correct = correct_match.group(1) == "yes" if correct_match else False
-                if correct:
-                    correctness_reward = 1.0
+                correct, extras = grade_answer(self.problem, output["answer"])
+                correctness_reward = correct
+                if correct >= 0.5:
+                    # TODO: this should be configurable
                     tool_reward = (self.max_num_calls - self.current_num_calls) / self.max_num_calls
                 # need to give the tool usage too
                 if self.coordinator is not None:
@@ -650,6 +560,7 @@ class SPEnv(Env):
                     "format_reward": format_reward,
                     "correctness_reward": correctness_reward,
                     "tool_reward": tool_reward,
+                    **extras,
                 }
             )
 
@@ -690,51 +601,6 @@ class SPEnv(Env):
 
 
 
-class FinewebDatum(TypedDict):
-    document: str
-    url: str
-
-
-def load_fineweb_dataset(split: Literal["train", "test"]) -> list[FinewebDatum]:
-    with open(f"tinker_cookbook/recipes/tool_use/self_play/{split}.jsonl", "r") as f:
-        fw = [json.loads(line.strip()) for line in f]
-
-    return [{"document": item["text"], "url": item["url"]} for item in fw]
-
-
-class QADatum(TypedDict):
-    question: str
-    answer: str
-
-def load_qa_dataset(split: str) -> list[QADatum]:
-    path = "/home/hyen/project/simple-evals/data/browse_comp_test_set_heldout.csv"
-
-    # TODO: move this to a utils file later
-    import base64
-    import hashlib
-    def derive_key(password: str, length: int) -> bytes:
-        """Derive a fixed-length key from the password using SHA256."""
-        hasher = hashlib.sha256()
-        hasher.update(password.encode())
-        key = hasher.digest()
-        return key * (length // len(key)) + key[: length % len(key)]
-
-    def decrypt(ciphertext_b64: str, password: str) -> str:
-        """Decrypt base64-encoded ciphertext with XOR."""
-        encrypted = base64.b64decode(ciphertext_b64)
-        key = derive_key(password, len(encrypted))
-        decrypted = bytes(a ^ b for a, b in zip(encrypted, key))
-        return decrypted.decode()
-
-    df = pd.read_csv(path)
-    qa = []
-    for _, row in df.iterrows():
-        problem = decrypt(row.get("problem", ""), row.get("canary", ""))
-        answer = decrypt(row.get("answer", ""), row.get("canary", ""))
-        qa.append({"question": problem, "answer": answer})
-
-    return qa
-
 
 @dataclass(frozen=True)
 class SPGroupBuilder(ProblemGroupBuilder):
@@ -766,6 +632,7 @@ class SPDataset(RLDataset):
         split: Literal["train", "test"] = "train",
         subset_size: int | None = None,
         max_trajectory_tokens: int = 32 * 1024,
+        max_tokens: int = 1024,
         max_num_calls: int = 4,
         self_play: bool = True,
         handling_mode: Literal["raise", "return", "continue"] = "raise",
@@ -775,17 +642,19 @@ class SPDataset(RLDataset):
         self.batch_size: int = batch_size
         self.group_size: int = group_size
         self.max_trajectory_tokens: int = max_trajectory_tokens
+        self.max_tokens: int = max_tokens
         self.max_num_calls: int = max_num_calls
         self.renderer: renderers.Renderer = renderer
-        # self.convo_prefix: list[renderers.Message] | None = convo_prefix
         self.search_tool: WebSearchTool = search_tool
         self.seed: int = seed
-        self.split: Literal["train", "test"] = split
+        self.split: Literal["fineweb", "bcplus", "browsecomp", "browsecomp_plus", "dsqa"] = split
 
-        if split == "train":
-            self.ds: list[FinewebDatum] = load_fineweb_dataset(split)
-        else:
+        if split in ["fineweb", "bcplus"]:
+            self.ds: list[SeedDatum] = load_seed_dataset(split, num_samples=subset_size)
+        elif split in ["browsecomp", "browsecomp_plus", "dsqa"]:
             self.ds: list[QADatum] = load_qa_dataset(split)
+        else:
+            raise ValueError(f"Unknown dataset: {split}")
 
         self.self_play: bool = self_play
         self.handling_mode: Literal["raise", "return", "continue"] = handling_mode
@@ -804,7 +673,7 @@ class SPDataset(RLDataset):
         # Each challenger environment will have group_size solver environments
         # Thus, each row will result in group_size challenger environments and group_size*group_size solver environments
 
-        if self.self_play and self.split == "train":
+        if self.self_play and self.split in ["fineweb", "bcplus"]:
             # each challenger and its set of group_size solver environments will share the same coordinator
             batches = []
             for idx, row in enumerate(self.ds[index * self.batch_size : (index + 1) * self.batch_size]):
@@ -815,12 +684,12 @@ class SPDataset(RLDataset):
                 batches.extend(solver_envs)
             return batches
 
-        elif self.split == "test":
+        elif self.split in ["browsecomp", "browsecomp_plus", "dsqa"]:
             # just testing the challenger
             # need some special logic for the solver groups so it doesn't wait for the challenger to make a move
             return [self._make_solver_env_group_builder(row=None, group_size=self.group_size, coordinator=None, problem=row) for row in self.ds[index * self.batch_size : (index + 1) * self.batch_size]]
         
-        else:        
+        else:
             # just training the challenger
             return [
                 self._make_env_group_builder(row, self.group_size)
@@ -830,7 +699,7 @@ class SPDataset(RLDataset):
     def __len__(self) -> int:
         return len(self.ds) // self.batch_size
     
-    def _make_challenger_env_group_builder(self, row: FinewebDatum, group_size: int, coordinator: SPCoordinator | None = None) -> SPGroupBuilder:
+    def _make_challenger_env_group_builder(self, row: SeedDatum, group_size: int, coordinator: SPCoordinator | None = None) -> SPGroupBuilder:
         return SPGroupBuilder(
             phase="challenger",
             coordinator=coordinator,
@@ -842,6 +711,7 @@ class SPDataset(RLDataset):
                 self.renderer,
                 convo_prefix=SPEnv.standard_fewshot_prefix(self.renderer, self.search_tool, 0),
                 max_trajectory_tokens=self.max_trajectory_tokens,
+                max_tokens=self.max_tokens,
                 max_num_calls=self.max_num_calls,
                 self_play=self.self_play,
                 handling_mode=self.handling_mode,
@@ -851,7 +721,7 @@ class SPDataset(RLDataset):
             num_envs=group_size,
         )
 
-    def _make_solver_env_group_builder(self, row: FinewebDatum, group_size: int, coordinator: SPCoordinator | None = None, problem: dict | None = None) -> SPGroupBuilder:
+    def _make_solver_env_group_builder(self, row: SeedDatum | QADatum, group_size: int, coordinator: SPCoordinator | None = None, problem: dict | None = None) -> SPGroupBuilder:
         # solver gets a special group builder because it also needs to pass in the player id
         return SPGroupBuilder(
             phase="solver",
@@ -864,6 +734,7 @@ class SPDataset(RLDataset):
                 self.renderer,
                 convo_prefix=SPEnv.standard_fewshot_prefix(self.renderer, self.search_tool, 1),
                 max_trajectory_tokens=self.max_trajectory_tokens,
+                max_tokens=self.max_tokens,
                 max_num_calls=self.max_num_calls,
                 self_play=self.self_play,
                 handling_mode=self.handling_mode,
@@ -883,6 +754,7 @@ class SPDataset(RLDataset):
                 problem=problem,
                 convo_prefix=SPEnv.standard_fewshot_prefix(self.renderer, self.search_tool, 1),
                 max_trajectory_tokens=self.max_trajectory_tokens,
+                max_tokens=self.max_tokens,
                 max_num_calls=self.max_num_calls,
                 self_play=self.self_play,
                 handling_mode=self.handling_mode,
@@ -902,21 +774,22 @@ class SPDatasetBuilder(RLDatasetBuilder):
     handling_mode: Literal["raise", "return", "continue"] = "raise"
     difficulty_reward_mode: Literal["variance", "linear", "none"] = "variance"
     tool_reward_mode: Literal["max", "mean", "none"] = "max"
+
+    train_split: Literal["fineweb", "bcplus"] = "fineweb"
+    eval_split: Literal["browsecomp", "browsecomp_plus", "dsqa"] = "browsecomp"
+    n_batches: int | None = None  # If set, limits the number of training batches
+
     model_name_for_tokenizer: str
     renderer_name: str
     search_tool_config: WebSearchToolConfig
-    # convo_prefix: list[renderers.Message] | None | Literal["standard"] = "standard"
-    seed: int = 0
+
     max_eval_size: int = 1024
     max_trajectory_tokens: int = 32 * 1024
+    max_tokens: int = 1024
     max_num_calls: int = 4
-    n_batches: int | None = None  # If set, limits the number of training batches
+    seed: int = 0
 
     async def __call__(self) -> tuple[SPDataset, None]:
-        # if self.convo_prefix == "standard":
-        #     convo_prefix = SPEnv.standard_fewshot_prefix()
-        # else:
-        #     convo_prefix = self.convo_prefix
         tokenizer = get_tokenizer(self.model_name_for_tokenizer)
         renderer = renderers.get_renderer(self.renderer_name, tokenizer=tokenizer)
 
@@ -932,9 +805,10 @@ class SPDatasetBuilder(RLDatasetBuilder):
             group_size=self.group_size,
             renderer=renderer,
             search_tool=search_tool,
-            split="train",
+            split=self.train_split,
             seed=self.seed,
             max_trajectory_tokens=self.max_trajectory_tokens,
+            max_tokens=self.max_tokens,
             max_num_calls=self.max_num_calls,
             subset_size=subset_size,
             handling_mode=self.handling_mode,
@@ -950,9 +824,10 @@ class SPDatasetBuilder(RLDatasetBuilder):
             group_size=self.eval_group_size,
             renderer=renderer,
             search_tool=search_tool,
-            split="test",
+            split=self.eval_split,
             seed=self.seed,
             max_trajectory_tokens=self.max_trajectory_tokens,
+            max_tokens=self.max_tokens,
             max_num_calls=self.eval_max_num_calls,
             subset_size=self.max_eval_size,
             handling_mode=self.handling_mode,
