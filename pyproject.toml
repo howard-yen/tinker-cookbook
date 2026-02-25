@@ -33,6 +33,7 @@ dependencies = [
     "tqdm",
     "modal",
     "wandb",
+    "scikit-learn>=1.8.0",
 ]
 
 [project.urls]

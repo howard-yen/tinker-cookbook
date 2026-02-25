@@ -10,25 +10,28 @@ RENDERER=${RENDERER:-''}  # Auto-detect if empty
 # Training hyperparameters
 LOSS_FN=${LOSS_FN:-'ppo'}
 LR=${LR:-1e-5}
-BZ=${BZ:-1}
-TOKENS=${TOKENS:-8192}
+BZ=${BZ:-2}
+TOKENS=${TOKENS:-4096} # max generation tokens
 SEED=${SEED:-42}
-EVAL_EVERY=${EVAL_EVERY:-2}
+EVAL_EVERY=${EVAL_EVERY:-0}
+N_BATCHES=${N_BATCHES:-'5'}  # Unlimited if empty
+EVAL_N_BATCHES=${EVAL_N_BATCHES:-'50'}  # Unlimited if empty
 
 # RL-specific parameters
 GS=${GS:-2}
 EGS=${EGS:-2}
 NS=${NS:-10}
-ENS=${ENS:-20}
-N_BATCHES=${N_BATCHES:-'2'}  # Unlimited if empty
-EVAL_N_BATCHES=${EVAL_N_BATCHES:-'50'}  # Unlimited if empty
-TRAJ_TOKENS=$((GS*TOKENS))
+ENS=${ENS:-25}
+TRAJ_TOKENS=${TRAJ_TOKENS:-32768} # max trajectory tokens
+
+TRAIN_SPLIT=${TRAIN_SPLIT:-'bcplus'}
+EVAL_SPLIT=${EVAL_SPLIT:-'browsecomp_plus'}
 
 # Self-play behavior
 SELF_PLAY=${SELF_PLAY:-true}
 HANDLING_MODE=${HANDLING_MODE:-'continue'}
 # linear, variance
-DIFFICULTY_REWARD_MODE=${DIFFICULTY_REWARD_MODE:-'linear'}
+DIFFICULTY_REWARD_MODE=${DIFFICULTY_REWARD_MODE:-'variance'}
 TOOL_REWARD_MODE=${TOOL_REWARD_MODE:-'min'}
 
 # Streaming configuration
@@ -36,7 +39,7 @@ STREAM_MINIBATCH=${STREAM_MINIBATCH:-false}
 NUM_MINIBATCHES=${NUM_MINIBATCHES:-4}
 
 # Web search tool settings
-VECTOR_SEARCH=${VECTOR_SEARCH:-true}
+VECTOR_SEARCH=${VECTOR_SEARCH:-false}
 PORT=${PORT:-8000}
 WEB_TOPK=${WEB_TOPK:-5}
 WEB_CONTENT_LENGTH=${WEB_CONTENT_LENGTH:-10000}
@@ -52,7 +55,7 @@ WANDB_NAME=${WANDB_NAME:-''}  # Auto-generated if empty
 SAVE_EVERY=${SAVE_EVERY:-2}
 
 # Build command with required parameters
-CMD="uv run python -m tinker_cookbook.recipes.tool_use.self_play.train \
+CMD="uv run python -m tinker_cookbook.recipes.self_play.train \
   model_name=$MODEL \
   batch_size=$BZ \
   loss_fn=$LOSS_FN \
@@ -82,7 +85,9 @@ CMD="uv run python -m tinker_cookbook.recipes.tool_use.self_play.train \
   web_tool_timeout=$WEB_TIMEOUT \
   run_tag=$TAG \
   wandb_project=$WANDB_PROJECT \
-  save_every=$SAVE_EVERY"
+  save_every=$SAVE_EVERY \
+  train_split=$TRAIN_SPLIT \
+  eval_split=$EVAL_SPLIT"
 
 # Add optional parameters if set
 [[ -n "$RENDERER" ]] && CMD="$CMD renderer_name=$RENDERER"
