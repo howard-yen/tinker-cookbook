@@ -12,6 +12,7 @@ from tinker_cookbook import cli_utils, model_info
 from tinker_cookbook.recipes.self_play.search_env import SPDatasetBuilder
 from tinker_cookbook.recipes.self_play.search_utils import WebSearchToolConfig
 from tinker_cookbook.rl import train
+from tinker_cookbook.utils.lr_scheduling import LRSchedule
 from tinker.types import LossFnType
 
 
@@ -26,6 +27,8 @@ class CLIConfig:
     # Training parameters
     loss_fn: LossFnType = "importance_sampling"
     learning_rate: float = 4e-5
+    lr_schedule: LRSchedule = "constant"
+    warmup_steps: int = 0
     batch_size: int = 512
     seed: int = 2
     max_tokens: int = 1024
@@ -149,6 +152,8 @@ async def cli_main(cli_config: CLIConfig):
         log_path=log_path,
         dataset_builder=builder,
         learning_rate=cli_config.learning_rate,
+        lr_schedule=cli_config.lr_schedule,
+        warmup_steps=cli_config.warmup_steps,
         max_tokens=cli_config.max_tokens,
         eval_every=cli_config.eval_every,
         wandb_project=cli_config.wandb_project,

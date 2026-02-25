@@ -10,6 +10,8 @@ RENDERER=${RENDERER:-''}  # Auto-detect if empty
 # Training hyperparameters
 LOSS_FN=${LOSS_FN:-'ppo'}
 LR=${LR:-1e-5}
+LR_SCHEDULE=${LR_SCHEDULE:-'cosine'}  # constant, linear, or cosine
+WARMUP_STEPS=${WARMUP_STEPS:-1}
 BZ=${BZ:-2}
 TOKENS=${TOKENS:-4096} # max generation tokens
 SEED=${SEED:-42}
@@ -60,6 +62,8 @@ CMD="uv run python -m tinker_cookbook.recipes.self_play.train \
   batch_size=$BZ \
   loss_fn=$LOSS_FN \
   learning_rate=$LR \
+  lr_schedule=$LR_SCHEDULE \
+  warmup_steps=$WARMUP_STEPS \
   max_tokens=$TOKENS \
   seed=$SEED \
   eval_every=$EVAL_EVERY \

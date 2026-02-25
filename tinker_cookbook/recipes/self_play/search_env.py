@@ -52,11 +52,11 @@ Document: {DOCUMENT}
 
 Write your final output in the json format:
 ```json
-{
+{{
     "question": "The question statement of the problem",
     "answer": "The answer to the problem",
     "explanation": "The explanation of the problem and what document sources were used to answer the question",
-}
+}}
 ```
 """.strip()
 
@@ -384,6 +384,8 @@ class SPEnv(Env):
             next_observation = self.renderer.build_generation_prompt(self.past_messages)
             if next_observation.length + self.max_tokens > self.max_trajectory_tokens:
                 logger.error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.")
+                if self.player_id == 0:
+                    await self._fallback_challenger()
                 return self.handle_error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.", override="return")
 
         elif tool_call.function.name == "visit":
@@ -408,8 +410,10 @@ class SPEnv(Env):
             next_observation = self.renderer.build_generation_prompt(self.past_messages)
             if next_observation.length + self.max_tokens > self.max_trajectory_tokens:
                 logger.error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.")
+                if self.player_id == 0:
+                    await self._fallback_challenger()
                 return self.handle_error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.", override="return")
-       
+
         else:
             return self.handle_error(f"Invalid tool name: {tool_call.function.name}\nMake sure to use only search or visit tools.")
 
@@ -420,6 +424,19 @@ class SPEnv(Env):
             next_stop_condition=self.stop_condition,
         )
 
+    async def _fallback_challenger(self) -> None:
+        logtree.log_text(f"{self.cid} Challenger {self.player_id} falling back to using oracle challenger")
+        response = litellm.completion(
+            model="openai/gpt-4.1-2025-04-14", 
+            messages=[{
+                "role": "user", "content": CHALLENGER_FALLBACK_SYSTEM_PROMPT.format(DOCUMENT=self.document)
+            }]
+        )
+        response = response['choices'][0]['message']['content']
+        output = self._extract_json(response)
+        if output is None:
+            raise ValueError(f"Invalid output: {response}")
+        await self.coordinator.make_move(self.player_id, output)
 
     async def challenger_final_step(self, content: str, correct_format: bool) -> StepResult:
         # correct format = json format is valid
@@ -434,7 +451,6 @@ class SPEnv(Env):
             if all(x in output for x in ["question", "answer", "explanation"]):
                 format_reward = FORMAT_REWARD
                 logger.debug(f"{self.cid} Challenger {self.player_id} making move with output: {output}")
-                print(f"{self.cid} Challenger {self.player_id} making move with output: {output}")
                 await self.coordinator.make_move(self.player_id, output)
                 await self.wait_for_turn()
 
@@ -472,20 +488,8 @@ class SPEnv(Env):
                     raise ValueError(f"Invalid tool reward mode: {self.tool_reward_mode}")
 
             else:
-                logger.debug(f"{self.cid} Challenger {self.player_id} falling back to using oracle challenger")
-                print(f"{self.cid} Challenger {self.player_id} falling back to using oracle challenger")
                 # fall back to using oracle challenger, don't need to wait for the solvers
-                response = litellm.completion(
-                    model="openai/gpt-4.1-2025-04-14", 
-                    messages=[{
-                        "role": "user", "content": CHALLENGER_FALLBACK_SYSTEM_PROMPT.format(DOCUMENT=self.document)
-                    }]
-                )
-                response = response['choices'][0]['message']['content']
-                output = self._extract_json(response)
-                if output is None:
-                    raise ValueError(f"Invalid output: {response}")
-                await self.coordinator.make_move(self.player_id, output)
+                await self._fallback_challenger()
             
             total_reward = format_reward + difficulty_reward + tool_reward
             # log the response

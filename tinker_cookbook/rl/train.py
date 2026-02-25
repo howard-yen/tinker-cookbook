@@ -42,6 +42,7 @@ from tinker_cookbook.rl.types import (
 )
 from tinker_cookbook.tokenizer_utils import Tokenizer
 from tinker_cookbook.utils import logtree, ml_log
+from tinker_cookbook.utils.lr_scheduling import LRSchedule, compute_schedule_lr_multiplier
 from tinker_cookbook.utils.misc_utils import all_same, safezip, split_list, timed
 from tinker_cookbook.utils.trace import scope, trace_init, update_scope_context
 
@@ -291,6 +292,10 @@ class Config:
     # -------------------------------------------------------------------------
     # Base learning rate used by Adam.
     learning_rate: float
+    # Learning rate schedule: "constant", "linear", or "cosine".
+    lr_schedule: LRSchedule = "constant"
+    # Number of steps to linearly warm up the learning rate from 0.
+    warmup_steps: int = 0
     # Builds the RL dataset; also determines number of groups per batch.
     dataset_builder: RLDatasetBuilder
     # Model name (base weights) to train.
@@ -370,6 +375,13 @@ class Config:
     num_groups_to_log: int = 4  # Number of groups to log per iteration (0 = disable logging)
 
 
+def _get_scheduled_lr(cfg: Config, i_batch: int, num_batches: int) -> float:
+    return cfg.learning_rate * compute_schedule_lr_multiplier(
+        lr_schedule=cfg.lr_schedule, step=i_batch, total_steps=num_batches,
+        warmup_steps=cfg.warmup_steps,
+    )
+
+
 @scope
 async def run_single_evaluation(evaluator, cfg, i_batch, sampling_client):
     ev_name = _get_evaluator_name(evaluator)
@@ -436,15 +448,16 @@ async def do_sync_training_with_stream_minibatch(
     )
 
     for i_batch in range(start_batch, end_batch):
+        scheduled_lr = _get_scheduled_lr(cfg, i_batch, num_batches)
         metrics = {
             "progress/batch": i_batch,
-            "optim/lr": cfg.learning_rate,
+            "optim/lr": scheduled_lr,
             "progress/done_frac": (i_batch + 1) / num_batches,
         }
         t_start = time.time()
 
         # Run evaluations
-        if (cfg.eval_every > 0 and i_batch % cfg.eval_every == 0) or i_batch == end_batch - 1:
+        if (cfg.eval_every > 0 and (i_batch + 1) % cfg.eval_every == 0 and i_batch > 0) or i_batch == end_batch - 1:
             with timed("run_evals", metrics):
                 eval_metrics = await run_evaluations_parallel(
                     evaluators, sampling_client, cfg, i_batch
@@ -508,6 +521,7 @@ async def do_sync_training_with_stream_minibatch(
                 training_client,
                 kl_reference_client,
                 tokenizer,
+                learning_rate=scheduled_lr,
             )
 
         # Log metrics
@@ -663,9 +677,10 @@ async def do_async_training(
                     return False
                 return True
 
+            scheduled_lr = _get_scheduled_lr(cfg, i_batch, num_batches)
             metrics = {
                 "training_client/step": i_batch,
-                "optim/lr": cfg.learning_rate,
+                "optim/lr": scheduled_lr,
                 "progress/done_frac": (i_batch + 1) / num_batches,
             }
             t_start = time.time()
@@ -685,6 +700,7 @@ async def do_async_training(
                     kl_reference_client,
                     tokenizer,
                     filter_stale_trajectory_group,
+                    learning_rate=scheduled_lr,
                 )
             else:
                 if not filter_stale_trajectory_group(wrapped_trajectory_group):
@@ -714,6 +730,7 @@ async def do_async_training(
                     tokenizer,
                     [g.env_group_builder for g in wrapped_trajectory_groups],
                     [g.trajectory_group for g in wrapped_trajectory_groups],
+                    learning_rate=scheduled_lr,
                 )
             sampling_client_step = i_batch + 1
             sampling_client_updated_event.set()
@@ -743,7 +760,7 @@ async def do_async_training(
             # while we're running the evals
             sampling_client_eval_step = sampling_client_step
             sampling_client_eval = sampling_client
-            if cfg.eval_every > 0 and sampling_client_eval_step % cfg.eval_every == 0 and sampling_client_eval_step > 0:
+            if cfg.eval_every > 0 and (sampling_client_eval_step + 1) % cfg.eval_every == 0 and sampling_client_eval_step > 0:
                 with timed("run_evals", metrics):
                     for evaluator in evaluators:
                         eval_metrics = await evaluator(sampling_client_eval)
@@ -898,6 +915,7 @@ async def do_train_step_streaming_and_get_sampling_client(
     kl_reference_client: tinker.SamplingClient | None,
     tokenizer: Tokenizer,
     trajectory_group_filter: Callable[[WrappedTrajectoryGroup | None], bool] = lambda _: True,
+    learning_rate: float | None = None,
 ) -> tuple[tinker.SamplingClient, dict[str, Any]]:
     """
     As soon as we have enough trajectories for a minibatch, we will train on them.
@@ -975,7 +993,8 @@ async def do_train_step_streaming_and_get_sampling_client(
 
         # Enqueue optim_step before awaiting results (so they land on same clock cycle)
         adam_params = tinker.AdamParams(
-            learning_rate=cfg.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
+            learning_rate=learning_rate if learning_rate is not None else cfg.learning_rate,
+            beta1=0.9, beta2=0.95, eps=1e-8,
         )
         with timed(f"train/optim_substep_{i_substep}_enqueue", metrics):
             optim_future = await training_client.optim_step_async(adam_params)
@@ -1027,9 +1046,11 @@ async def do_train_step_and_get_sampling_client(
     tokenizer: Tokenizer,
     env_group_builders_P: Sequence[EnvGroupBuilder],
     trajectory_groups_P: list[TrajectoryGroup],
+    learning_rate: float | None = None,
 ) -> tuple[tinker.SamplingClient, dict[str, Any]]:
     update_scope_context({"step": i_batch})
 
+    effective_lr = learning_rate if learning_rate is not None else cfg.learning_rate
     metrics = {}
     data_D, prepare_minibatch_metrics = await prepare_minibatch(
         env_group_builders_P,
@@ -1045,7 +1066,7 @@ async def do_train_step_and_get_sampling_client(
         training_logprobs_D = await train_step(
             data_D=data_D,
             training_client=training_client,
-            learning_rate=cfg.learning_rate,
+            learning_rate=effective_lr,
             num_substeps=cfg.num_substeps,
             loss_fn=cfg.loss_fn,
             loss_fn_config=cfg.loss_fn_config,
@@ -1088,15 +1109,16 @@ async def do_sync_training(
     )
 
     for i_batch in range(start_batch, end_batch):
+        scheduled_lr = _get_scheduled_lr(cfg, i_batch, num_batches)
         metrics = {
             "progress/batch": i_batch,
-            "optim/lr": cfg.learning_rate,
+            "optim/lr": scheduled_lr,
             "progress/done_frac": (i_batch + 1) / num_batches,
         }
         t_start = time.time()
 
         # Run evaluations
-        if cfg.eval_every > 0 and i_batch % cfg.eval_every == 0:
+        if cfg.eval_every > 0 and (i_batch + 1) % cfg.eval_every == 0 and i_batch > 0:
             with timed("run_evals", metrics):
                 eval_metrics = await run_evaluations_parallel(
                     evaluators, sampling_client, cfg, i_batch
@@ -1142,6 +1164,7 @@ async def do_sync_training(
             tokenizer,
             env_group_builders_P,
             trajectory_groups_P,
+            learning_rate=scheduled_lr,
         )
 
         # Log metrics
