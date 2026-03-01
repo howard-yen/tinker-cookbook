@@ -12,6 +12,7 @@ from tinker_cookbook import cli_utils, model_info
 from tinker_cookbook.recipes.self_play.search_env import SPDatasetBuilder
 from tinker_cookbook.recipes.self_play.search_utils import WebSearchToolConfig
 from tinker_cookbook.rl import train
+from tinker_cookbook.rl.value_function import ValueFunctionConfig
 from tinker_cookbook.utils.lr_scheduling import LRSchedule
 from tinker.types import LossFnType
 
@@ -22,7 +23,7 @@ class CLIConfig:
     model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
     lora_rank: int = 32
     renderer_name: str | None = None
-    vector_search: bool = False
+    search_mode: Literal["default", "vector", "single"] = "default"
 
     # Training parameters
     loss_fn: LossFnType = "importance_sampling"
@@ -42,14 +43,15 @@ class CLIConfig:
     max_num_calls: int = 4
     n_batches: int | None = None  # If set, limits the number of training batches
     eval_n_batches: int = 100 # this should always be set to control number of eval baatches
-    train_split: Literal["fineweb", "bcplus"] = "fineweb"
-    eval_split: Literal["browsecomp", "browsecomp_plus", "dsqa"] = "browsecomp"
+    train_split: Literal["fineweb", "bcplus", "browsecomp_plus_train"] = "fineweb"
+    eval_split: Literal["browsecomp", "browsecomp_plus", "dsqa", "browsecomp_plus_test"] = "browsecomp"
 
     # Self-play parameters
     self_play: bool = True
     handling_mode: Literal["raise", "return", "continue"] = "raise"
     difficulty_reward_mode: Literal["variance", "linear", "none"] = "variance"
     tool_reward_mode: Literal["max", "mean", "min", "none"] = "min"
+    do_fallback_challenger: bool = True
 
     # Web tool parameters
     web_tool_port: int = 8000
@@ -59,11 +61,23 @@ class CLIConfig:
     web_tool_chunking_func: str = "newline"
     web_tool_timeout: float = 300.0
 
+    # Value function parameters
+    use_value_function: bool = False
+    value_model_name: str | None = None  # defaults to model_name if not set
+    value_lr: float = 1e-4
+    gae_lambda: float = 0.95
+    value_head_intermediate_size: int = 256
+    num_value_epochs: int = 1
+    value_lora_rank: int | None = 16
+    freeze_value_backbone: bool = False
+    value_gpu_ids: list[int] | None = None  # e.g. [6,7] to place value model on specific GPUs
+
     # Streaming configuration
     stream_minibatch: bool = False
     num_minibatches: int = 4
 
     # Logging parameters
+    num_groups_to_log: int = 4
     log_path: str | None = None
     wandb_project: str | None = None
     wandb_name: str | None = None
@@ -82,7 +96,7 @@ async def cli_main(cli_config: CLIConfig):
         scoring_func=cli_config.web_tool_scoring_func,
         chunking_func=cli_config.web_tool_chunking_func,
         timeout=cli_config.web_tool_timeout,
-        vector_search=cli_config.vector_search,
+        search_mode=cli_config.search_mode,
     )
 
     # Get renderer name
@@ -110,7 +124,22 @@ async def cli_main(cli_config: CLIConfig):
         handling_mode=cli_config.handling_mode,
         difficulty_reward_mode=cli_config.difficulty_reward_mode,
         tool_reward_mode=cli_config.tool_reward_mode,
+        do_fallback_challenger=cli_config.do_fallback_challenger,
     )
+
+    # Configure value function
+    value_function_config = None
+    if cli_config.use_value_function:
+        value_function_config = ValueFunctionConfig(
+            model_name=cli_config.value_model_name or cli_config.model_name,
+            learning_rate=cli_config.value_lr,
+            gae_lambda=cli_config.gae_lambda,
+            value_head_intermediate_size=cli_config.value_head_intermediate_size,
+            num_value_epochs=cli_config.num_value_epochs,
+            lora_rank=cli_config.value_lora_rank,
+            freeze_backbone=cli_config.freeze_value_backbone,
+            gpu_ids=cli_config.value_gpu_ids,
+        )
 
     # Configure streaming minibatch
     if cli_config.stream_minibatch:
@@ -126,7 +155,9 @@ async def cli_main(cli_config: CLIConfig):
     # Build run name
     model_name_short = cli_config.model_name.lower().replace("/", "-")
     date_and_time = datetime.now().strftime("%Y-%m-%d-%H-%M")
-    run_name = f"self_play{cli_config.run_tag}_{model_name_short}_{bs_str}_gs{cli_config.group_size}_seed{cli_config.seed}_tracj{cli_config.max_trajectory_tokens // 1024}k_lr{cli_config.learning_rate}_rank{cli_config.lora_rank}_nc{cli_config.max_num_calls}_hm{cli_config.handling_mode}_drm{cli_config.difficulty_reward_mode}_trm{cli_config.tool_reward_mode}_{date_and_time}"
+    gae_suffix = "_gae" if cli_config.use_value_function else ""
+    fallback_suffix = "" if cli_config.do_fallback_challenger else "_nofb"
+    run_name = f"self_play{cli_config.run_tag}_{model_name_short}_{bs_str}_gs{cli_config.group_size}_seed{cli_config.seed}_tracj{cli_config.max_trajectory_tokens // 1024}k_lr{cli_config.learning_rate}_rank{cli_config.lora_rank}_nc{cli_config.max_num_calls}_hm{cli_config.handling_mode}_drm{cli_config.difficulty_reward_mode}_trm{cli_config.tool_reward_mode}{fallback_suffix}{gae_suffix}_{date_and_time}"
 
     # Set log path
     if cli_config.log_path is not None:
@@ -162,6 +193,8 @@ async def cli_main(cli_config: CLIConfig):
         stream_minibatch_config=stream_minibatch_config,
         loss_fn=cli_config.loss_fn,
         save_every=cli_config.save_every,
+        value_function_config=value_function_config,
+        num_groups_to_log=cli_config.num_groups_to_log,
     )
 
     # Run training

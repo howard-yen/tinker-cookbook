@@ -1,14 +1,17 @@
 import base64
 import hashlib
 import json
-import litellm
+import time
 import re
 import textwrap
 from typing import Literal, TypedDict
 
+import litellm
 import pandas as pd
 from pydantic import BaseModel
+from transformers import AutoTokenizer
 from datasets import load_dataset
+from nltk.tokenize import NLTKWordTokenizer
 
 
 GRADER_TEMPLATE = """
@@ -191,6 +194,18 @@ def load_seed_dataset(split: Literal['fineweb', 'bcplus'], num_samples: int = 10
     else:
         raise ValueError(f"Unknown dataset: {split}")
 
+    # truncate documents to at most 4k words
+    tokenizer = NLTKWordTokenizer()
+    def truncate(x):
+        tokens = list(tokenizer.span_tokenize(x['text']))
+        if len(tokens) > 4096:
+            return {"text": x['text'][tokens[4096][0]] + "... [truncated]"}
+        return x
+    ds = ds.map(truncate)
+    # from manual inspection, there are a few documents (<10) that are too long by tokens. those look pretty noisy anyway so let's just filter them out
+    tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-120b")
+    # not too short, not too long
+    ds = ds.filter(lambda x: 128 <= len(tokenizer(x['text']).input_ids) <= 8192)
     sample_dataset = ds.shuffle(seed=42).select(range(num_samples))
     return [{"document": item["text"], "url": item["url"]} for item in sample_dataset]
 
@@ -226,8 +241,8 @@ def load_qa_dataset(split: str) -> list[QADatum]:
             answer = _decrypt(row.get("answer", ""), row.get("canary", ""))
             qa.append({"question": problem, "answer": answer})
     
-    elif split == "browsecomp_plus":
-        path = "/home/hyen/project/simple-evals/data/bc_plus.jsonl"
+    elif "browsecomp_plus" in  split:
+        path = f"/home/hyen/project/simple-evals/data/{split}.jsonl"
         with open(path, "r") as f:
             bc_plus = [json.loads(line.strip()) for line in f]
         qa = [{"question": item["query"], "answer": item["answer"]} for item in bc_plus]
@@ -245,6 +260,19 @@ def load_qa_dataset(split: str) -> list[QADatum]:
     return qa
 
 
+def api_call_with_retry(model: str, messages: list[dict], response_format: BaseModel | None = None):
+    models = ['azure/gpt-4.1', 'azure/gpt-5.2', 'azure/gpt-5', 'azure/gpt-4o', 'azure/o3', 'azure/o4-mini', 'azure/gpt-4.1-mini', 'openai/gpt-4.1-2025-04-14']
+    for m in models:
+        for attempt in range(3):
+            try:
+                response = litellm.completion(model=m, messages=messages, response_format=response_format)
+                return response
+            except Exception:
+                time.sleep((attempt + 1) * 2)
+
+    raise Exception(f"Failed to call API after trying all models {models}")
+
+
 def grade_answer(problem: dict, response: str) -> tuple[float, dict]:
     # return (primary_score, dict of secondary scores)
     # grades the response to the problem, support rubric-based grading like for DSQA
@@ -252,18 +280,15 @@ def grade_answer(problem: dict, response: str) -> tuple[float, dict]:
 
     if problem.get("answer_type") is not None:
         # rubric-based grading for DSQA
-        grading_response = litellm.completion(
-            model="azure/gpt-4.1", 
-            messages=[{
-                "role": "user", "content": DSQA_GRADER_PROMPT + DSQA_GRADER_OUTPUT_EXAMPLE.format(
-                    prompt=problem["question"], 
-                    prompt_type=problem["answer_type"],
-                    answer=answer,
-                    response=response, 
-                )
-            }],
+        grading_response = api_call_with_retry(
+            # model="azure/gpt-4.1", 
+            model="openai/gpt-4.1-2025-04-14", 
+            messages=[{"role": "user", "content": DSQA_GRADER_PROMPT + DSQA_GRADER_OUTPUT_EXAMPLE.format(
+                    prompt=problem["question"], prompt_type=problem["answer_type"], answer=answer, response=response, 
+            )}],
             response_format=DSQAExtractedResult,
         )
+
         grading_response = grading_response['choices'][0]['message']['content']
         extracted_result = DSQAExtractedResult.model_validate_json(grading_response)
         metrics = calculate_dsqa_metrics(extracted_result)
@@ -272,15 +297,13 @@ def grade_answer(problem: dict, response: str) -> tuple[float, dict]:
 
     else:
         # single answer grading
-        grading_response = litellm.completion(
-            model="azure/gpt-4.1", 
-            messages=[{
-                "role": "user", "content": GRADER_TEMPLATE.format(
-                    question=problem["question"], 
-                    response=response, 
-                    correct_answer=answer,
-                )
-            }]
+        grading_response = api_call_with_retry(
+            # model="azure/gpt-4.1", 
+            model="openai/gpt-4.1-2025-04-14", 
+            messages=[{"role": "user", "content": GRADER_TEMPLATE.format(
+                question=problem["question"], response=response, correct_answer=answer,
+            )}],
+            response_format=None,
         )
         # primary score is correctness score
         grading_response = grading_response['choices'][0]['message']['content']

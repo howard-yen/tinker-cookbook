@@ -29,7 +29,7 @@ from tinker_cookbook.renderers.base import get_text_content
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.utils import logtree
 from tinker_cookbook.recipes.self_play.search_utils import WebSearchTool, WebSearchToolConfig
-from tinker_cookbook.recipes.self_play.utils import grade_answer, SeedDatum, load_seed_dataset, QADatum, load_qa_dataset
+from tinker_cookbook.recipes.self_play.utils import grade_answer, SeedDatum, load_seed_dataset, QADatum, load_qa_dataset, api_call_with_retry
 
 
 # Suppress LiteLLM INFO messages
@@ -65,12 +65,14 @@ CHALLENGER_SYSTEM_PROMPT = """
 You are an expert teaching who writes challenging questions for a student to solve.
 You are given a document and a url as the starting point, and you will have access to tools to help you collect more informaiton to write a challenging question.
 The student will not have access to the given document, and will need to use the tools to collect information to answer the question. Thus, do not include any explicit references the document you are given.
+Importantly, your question and answer MUST BE grounded in the documents you are given or collected from the tools. You should explicitly state the document sources you used to answer the question in your explanation.
 
 Use the tools to collect information to write a challenging, clear, motivated, and solvable problem. Use the given document and url as a starting point. 
 For example, you may use the tools to collect more information about the topic of the document.
 Then, after you have collected enough information, write a problem with both the question statement and the answer. 
 The question should require reasoning over many documents to answer, so you should use the tools at least once to collect more documents.
 Both the question statement and the answer should be clear, unambiguous, and concise, the answer should be easily verifiable and does not exceed more than 20 words. 
+The explanation should explicitly cite the document sources you used to answer the question.
 
 Write your final output in the json format:
 ```json
@@ -160,7 +162,10 @@ class SPCoordinator:
     
     async def make_move(self, player: int, move) -> None:
         # if the challenger makes a move, save the problem to solver results and notify the solver
+        # challenger's move is a dict with keys "question", "answer", "explanation"
+        # special case: False means the challenger failed to make a move, the game is done, and the solver should not attempt
         # if the solver makes a move, solve the problem and conclude the game
+        # the solver's move is a tuple of (correctness bool, num tool calls)
         self.status[player] = "make move"
         logger.debug(f"{self.id}: {self.status}")
         async with self.condition:
@@ -206,6 +211,7 @@ class SPEnv(Env):
         handling_mode: Literal["raise", "return", "continue"] = "raise",
         difficulty_reward_mode: Literal["variance", "linear", "none"] = "variance",
         tool_reward_mode: Literal["max", "mean", "none"] = "max",
+        do_fallback_challenger: bool = True,
     ):
         self.renderer: renderers.Renderer = renderer
         self.convo_prefix: list[renderers.Message] | None = convo_prefix
@@ -219,6 +225,9 @@ class SPEnv(Env):
         if self.coordinator is not None:
             assert 0 <= player_id <= coordinator.num_solvers, f"Invalid player id: {player_id}, expect at most {coordinator.num_solvers} solvers"
             self.cid = coordinator.id
+        elif player_id == 0:
+            # Standalone challenger mode: no coordinator, no problem needed
+            self.cid = hashlib.sha256(document[:100].encode()).hexdigest()[:8]
         else:
             assert problem is not None, "Problem is required when coordinator is None"
             self.cid = hashlib.sha256(problem["question"].encode()).hexdigest()[:8]
@@ -226,6 +235,7 @@ class SPEnv(Env):
         self.document: str = document
         self.url: str = url
         self.problem: dict | None = problem
+        self.generated_output: dict | None = None
         self.search_tool: WebSearchTool = search_tool
         self.max_trajectory_tokens: int = max_trajectory_tokens
         self.past_messages: list[renderers.Message] = convo_prefix.copy() if convo_prefix else []
@@ -235,6 +245,7 @@ class SPEnv(Env):
         self.handling_mode: Literal["raise", "return", "continue"] = handling_mode
         self.difficulty_reward_mode: Literal["variance", "linear", "none"] = difficulty_reward_mode
         self.tool_reward_mode: Literal["max", "mean", "none"] = tool_reward_mode
+        self.do_fallback_challenger: bool = do_fallback_challenger
 
 
     @property
@@ -272,8 +283,11 @@ class SPEnv(Env):
                 self.problem = problem
             else:
                 problem = self.problem
+            
+            if problem is False:
+                # return special value that indicate this rollout should be dropped
+                return None, self.stop_condition
 
-            problem_summary = str(problem)[:100] + "..." if problem else "None"
             logtree.log_text(f"{self.cid} Solver {self.player_id} waiting for turn completed, starting to solve {problem}")
             logger.debug(f"{self.cid} Solver {self.player_id} waiting for turn completed, starting to solve {problem}")
             if problem is None:
@@ -307,17 +321,21 @@ class SPEnv(Env):
 
 
     async def call_search_tool(self, tool_call: renderers.ToolCall) -> list[renderers.Message]:
-        query_list = json.loads(tool_call.function.arguments)["query_list"]
+        args = json.loads(tool_call.function.arguments)
+        query_list, error = self.search_tool.validate_and_extract_search_args(args)
+        if error:
+            return [renderers.Message(role="tool", name="search", content=error)]
         async with _CONNECTION_SEMAPHORE:
             search_results = await self.search_tool.batch_search(query_list)
             logtree.log_text(f"Search results: {search_results}")
             return [renderers.Message(role="tool", name="search", content=search_results)]
 
-    
     async def call_browse_tool(self, tool_call: renderers.ToolCall) -> list[renderers.Message]:
         args = json.loads(tool_call.function.arguments)
-        url_list = args["url_list"]
-        query_list = args.get("query_list", None)
+        visit_args, error = self.search_tool.validate_and_extract_visit_args(args)
+        if error:
+            return [renderers.Message(role="tool", name="visit", content=error)]
+        url_list, query_list = visit_args
         async with _CONNECTION_SEMAPHORE:
             browse_results = await self.search_tool.batch_browse(url_list, query_list)
             logtree.log_text(f"Browse results: {browse_results}")
@@ -330,6 +348,7 @@ class SPEnv(Env):
             episode_done=True,
             next_observation=tinker.ModelInput.empty(),
             next_stop_condition=self.stop_condition,
+            metrics={("challenger" if self.player_id == 0 else "solver") + "_num_calls": self.current_num_calls},
         )
     
     def get_invalid_results(self) -> StepResult:
@@ -361,61 +380,31 @@ class SPEnv(Env):
             return self.handle_error("No tool calls found in the previous message.")
         
         tool_call = tool_calls[0]
-        if tool_call.function.name == "search":
-            # check for tool call validity
-            if self.current_num_calls >= self.max_num_calls:
-                tool_return_message = [renderers.Message(role="tool", name="search", content="Error calling search tool: Max number of calls reached, please complete the task without using any more tools.")]
-                self.past_messages.extend(tool_return_message)
-            
-            elif "query_list" not in tool_call.function.arguments:
-                self.current_num_calls += 1
-                return self.handle_error(f"Query list not found in tool calls: {tool_call.function.arguments}\nMake sure to include a query_list argument when using the search tool.")
-            
-            else:
-                self.current_num_calls += 1
-                try:
-                    with logtree.scope_details(f"Search tool call {self.current_num_calls}"):
-                        logtree.log_text(f"Search tool arguments: {tool_call.function.arguments}")
-                        tool_return_message = await self.call_search_tool(tool_call)
-                    self.past_messages.extend(tool_return_message)
-                except Exception as e:
-                    return self.handle_error(f"Error calling search tool: {repr(e)}")
-
-            next_observation = self.renderer.build_generation_prompt(self.past_messages)
-            if next_observation.length + self.max_tokens > self.max_trajectory_tokens:
-                logger.error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.")
-                if self.player_id == 0:
-                    await self._fallback_challenger()
-                return self.handle_error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.", override="return")
-
-        elif tool_call.function.name == "visit":
-            if self.current_num_calls >= self.max_num_calls:
-                tool_return_message = [renderers.Message(role="tool", name="visit", content="Error calling visit tool: Max number of calls reached, please complete the task without using any more tools.")]
-                self.past_messages.extend(tool_return_message)
-            
-            elif "url_list" not in tool_call.function.arguments:
-                self.current_num_calls += 1
-                return self.handle_error(f"Invalid argument in tool calls: {tool_call.function.arguments}\nMake sure to include the required arguments when using the visit tool.")
-            
-            else:
-                self.current_num_calls += 1
-                try:
-                    with logtree.scope_details(f"Browse tool call {self.current_num_calls}"):
-                        logtree.log_text(f"Browse tool arguments: {tool_call.function.arguments}")
-                        tool_return_message = await self.call_browse_tool(tool_call)
-                    self.past_messages.extend(tool_return_message)
-                except Exception as e:
-                    return self.handle_error(f"Error calling visit tool: {repr(e)}")
-
-            next_observation = self.renderer.build_generation_prompt(self.past_messages)
-            if next_observation.length + self.max_tokens > self.max_trajectory_tokens:
-                logger.error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.")
-                if self.player_id == 0:
-                    await self._fallback_challenger()
-                return self.handle_error(f"Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.", override="return")
-
-        else:
+        if tool_call.function.name not in ("search", "visit"):
             return self.handle_error(f"Invalid tool name: {tool_call.function.name}\nMake sure to use only search or visit tools.")
+
+        tool_label = "Search" if tool_call.function.name == "search" else "Browse"
+
+        if self.current_num_calls >= self.max_num_calls:
+            tool_return_message = [renderers.Message(role="tool", name=tool_call.function.name, content=f"Error calling {tool_call.function.name} tool: Max number of calls reached, please complete the task without using any more tools.")]
+            self.past_messages.extend(tool_return_message)
+        else:
+            self.current_num_calls += 1
+            try:
+                with logtree.scope_details(f"{tool_label} tool call {self.current_num_calls}"):
+                    logtree.log_text(f"{tool_label} tool arguments: {tool_call.function.arguments}")
+                    if tool_call.function.name == "search":
+                        tool_return_message = await self.call_search_tool(tool_call)
+                    else:
+                        tool_return_message = await self.call_browse_tool(tool_call)
+                self.past_messages.extend(tool_return_message)
+            except Exception as e:
+                return self.handle_error(f"Error calling {tool_call.function.name} tool: {repr(e)}")
+
+        next_observation = self.renderer.build_generation_prompt(self.past_messages)
+        if next_observation.length + self.max_tokens > self.max_trajectory_tokens:
+            logger.error(f"{self.cid} {self.player_id} Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.")
+            return self.handle_error(f"{self.cid} {self.player_id} Next observation is too long: {next_observation.length} + {self.max_tokens} > {self.max_trajectory_tokens}\nMake sure to keep the observation within the maximum trajectory length.", override="return")
 
         return StepResult(
             reward=0.0,
@@ -426,12 +415,12 @@ class SPEnv(Env):
 
     async def _fallback_challenger(self) -> None:
         logtree.log_text(f"{self.cid} Challenger {self.player_id} falling back to using oracle challenger")
-        response = litellm.completion(
-            model="openai/gpt-4.1-2025-04-14", 
-            messages=[{
-                "role": "user", "content": CHALLENGER_FALLBACK_SYSTEM_PROMPT.format(DOCUMENT=self.document)
-            }]
+        response = api_call_with_retry(
+            model="azure/gpt-4.1", 
+            messages=[{"role": "user", "content": CHALLENGER_FALLBACK_SYSTEM_PROMPT.format(DOCUMENT=self.document)}],
+            response_format=None,
         )
+
         response = response['choices'][0]['message']['content']
         output = self._extract_json(response)
         if output is None:
@@ -450,51 +439,61 @@ class SPEnv(Env):
             output = self._extract_json(content)
             if all(x in output for x in ["question", "answer", "explanation"]):
                 format_reward = FORMAT_REWARD
+                self.generated_output = output
                 logger.debug(f"{self.cid} Challenger {self.player_id} making move with output: {output}")
-                await self.coordinator.make_move(self.player_id, output)
-                await self.wait_for_turn()
 
-                # only calculate difficulty and tool reward if the solver uses problem generated by the real challenger
-                correctness = self.coordinator.solver_results
-                logtree.log_text(f"Solver correctness: {correctness}")
-                if self.difficulty_reward_mode == "variance":
-                    difficulty_reward = np.exp(-(np.var(correctness) - 0.25) ** 2 / 0.02)
-                    difficulty_reward = float(difficulty_reward)
-                elif self.difficulty_reward_mode == "linear":
-                    difficulty_reward = 1.1 - np.mean(correctness)
-                elif self.difficulty_reward_mode == "none":
-                    difficulty_reward = 0.0
-                else:
-                    raise ValueError(f"Invalid difficulty reward mode: {self.difficulty_reward_mode}")
-                
-                tool_use = self.coordinator.solver_tools
-                logtree.log_text(f"Solver tool use: {tool_use}")
-                correct_tool_use = [t for (c, t) in zip(correctness, tool_use) if c]
-                # note that the max num tool call may not be the same between challenger and solver, TODO!
-                if self.tool_reward_mode == "max":
-                    # take the maximum number of tool calls among correct trajectories
-                    if len(correct_tool_use) > 0:
-                        tool_reward = float(np.max(correct_tool_use) / self.max_num_calls)
-                elif self.tool_reward_mode == "mean":
-                    # take the mean number of tool calls among correct trajectories
-                    if len(correct_tool_use) > 0:
-                        tool_reward = float(np.mean(correct_tool_use) / self.max_num_calls)
-                elif self.tool_reward_mode == "min":
-                    if len(correct_tool_use) > 0:
-                        tool_reward = float(np.min(correct_tool_use) / self.max_num_calls)
-                elif self.tool_reward_mode == "none":
-                    tool_reward = 0.0
-                else:
-                    raise ValueError(f"Invalid tool reward mode: {self.tool_reward_mode}")
+                if self.coordinator is not None:
+                    await self.coordinator.make_move(self.player_id, output)
+                    await self.wait_for_turn()
+
+                    # only calculate difficulty and tool reward if the solver uses problem generated by the real challenger
+                    correctness = self.coordinator.solver_results
+                    logtree.log_text(f"Solver correctness: {correctness}")
+                    if self.difficulty_reward_mode == "variance":
+                        difficulty_reward = np.exp(-(np.var(correctness) - 0.25) ** 2 / 0.02)
+                        difficulty_reward = float(difficulty_reward)
+                    elif self.difficulty_reward_mode == "linear":
+                        difficulty_reward = 1.1 - np.mean(correctness)
+                    elif self.difficulty_reward_mode == "none":
+                        difficulty_reward = 0.0
+                    else:
+                        raise ValueError(f"Invalid difficulty reward mode: {self.difficulty_reward_mode}")
+
+                    tool_use = self.coordinator.solver_tools
+                    logtree.log_text(f"Solver tool use: {tool_use}")
+                    correct_tool_use = [t for (c, t) in zip(correctness, tool_use) if c]
+                    # note that the max num tool call may not be the same between challenger and solver, TODO!
+                    if self.tool_reward_mode == "max":
+                        # take the maximum number of tool calls among correct trajectories
+                        if len(correct_tool_use) > 0:
+                            tool_reward = float(np.max(correct_tool_use) / self.max_num_calls)
+                    elif self.tool_reward_mode == "mean":
+                        # take the mean number of tool calls among correct trajectories
+                        if len(correct_tool_use) > 0:
+                            tool_reward = float(np.mean(correct_tool_use) / self.max_num_calls)
+                    elif self.tool_reward_mode == "min":
+                        if len(correct_tool_use) > 0:
+                            tool_reward = float(np.min(correct_tool_use) / self.max_num_calls)
+                    elif self.tool_reward_mode == "none":
+                        tool_reward = 0.0
+                    else:
+                        raise ValueError(f"Invalid tool reward mode: {self.tool_reward_mode}")
 
             else:
                 # fall back to using oracle challenger, don't need to wait for the solvers
-                await self._fallback_challenger()
+                if self.coordinator is not None:
+                    if self.do_fallback_challenger:
+                        await self._fallback_challenger()
+                    else:
+                        # just return failure to coordinator
+                        await self.coordinator.make_move(self.player_id, False)
             
             total_reward = format_reward + difficulty_reward + tool_reward
             # log the response
             logtree.log_text(f"==========Challenger Final Output==========")
             logtree.log_text(f"Initial document: {self.document[:500]}...")
+            with logtree.scope_details("Challenger Initial Document"):
+                logtree.log_text(self.document)
             logtree.log_text(f"Response: {content}")
             logtree.log_text(f"Format reward: {format_reward}")
             logtree.log_text(f"Difficulty reward: {difficulty_reward}")
@@ -507,10 +506,10 @@ class SPEnv(Env):
                 next_observation=tinker.ModelInput.empty(),
                 next_stop_condition=self.stop_condition,
                 metrics={
-                    "num_calls": self.current_num_calls,
-                    "format_reward": format_reward,
-                    "difficulty_reward": difficulty_reward,
-                    "tool_reward": tool_reward,
+                    "challenger_num_calls": self.current_num_calls,
+                    "challenger_format_reward": format_reward,
+                    "challenger_difficulty_reward": difficulty_reward,
+                    "challenger_tool_reward": tool_reward,
                 }
             )
             
@@ -560,10 +559,10 @@ class SPEnv(Env):
                 next_observation=tinker.ModelInput.empty(),
                 next_stop_condition=self.stop_condition,
                 metrics={
-                    "num_calls": self.current_num_calls,
-                    "format_reward": format_reward,
-                    "correctness_reward": correctness_reward,
-                    "tool_reward": tool_reward,
+                    "solver_num_calls": self.current_num_calls,
+                    "solver_format_reward": format_reward,
+                    "solver_correctness_reward": correctness_reward,
+                    "solver_tool_reward": tool_reward,
                     **extras,
                 }
             )
@@ -572,28 +571,63 @@ class SPEnv(Env):
             return self.handle_error(f"Invalid output: {content}\nMake sure to output the final answer and explanation in the json format.")
 
 
+    async def _ensure_coordinator_notified(self) -> None:
+        """Safety net: ensure coordinator is notified when an episode ends.
+
+        Without this, a solver/challenger that exits early (e.g. due to format
+        errors or trajectory length limits) can leave the other side waiting
+        forever on the coordinator condition, causing a deadlock.
+        """
+        if self.coordinator is None or self.coordinator.game_done:
+            return
+        if self.player_id > 0 and self.coordinator.solver_results[self.player_id - 1] is None:
+            logger.warning(f"{self.cid} Solver {self.player_id} episode ending without make_move, signaling failure to coordinator")
+            await self.coordinator.make_move(self.player_id, (False, self.current_num_calls))
+        elif self.player_id == 0 and self.coordinator.current_phase == "challenger":
+            if self.do_fallback_challenger:
+                logger.warning(f"{self.cid} Challenger episode ending without make_move, using fallback")
+                try:
+                    await self._fallback_challenger()
+                except Exception as e:
+                    logger.error(f"{self.cid} Fallback challenger failed: {e}, marking game as done")
+                    async with self.coordinator.condition:
+                        self.coordinator.done = True
+                        self.coordinator.condition.notify_all()
+            else:
+                logger.warning(f"{self.cid} Challenger episode ending without make_move, not using fallback, just returning failure to coordinator")
+                await self.coordinator.make_move(self.player_id, False)
+
+
     async def step(self, action: Action) -> StepResult:
         # if this is the challenger's environment, we go ahead and take a step
         # if this is the solver's environment, we wait for the challenger to make a move first
         # but that is already handled in the initial observation function
-        
+
         message, parse_success = self.renderer.parse_response(action)
         self.past_messages.append(message)
-        
-        if "tool_calls" in message:
-            return await self.call_tool(message)
 
-        else:
-            # challenger and solve share different logic here
-            # the message is a list with different types (thinking vs. text), we only care about the text message
-            content = get_text_content(message)
-            correct_format = float(parse_success) and float(self.check_format(content))
-            logger.debug(f"{self.cid} {self.player_id} final step")
-
-            if self.player_id == 0:            
-                return await self.challenger_final_step(content, correct_format)
+        try:
+            if "tool_calls" in message:
+                result = await self.call_tool(message)
             else:
-                return await self.solver_final_step(content, correct_format)
+                # challenger and solve share different logic here
+                # the message is a list with different types (thinking vs. text), we only care about the text message
+                content = get_text_content(message)
+                correct_format = float(parse_success) and float(self.check_format(content))
+                logger.debug(f"{self.cid} {self.player_id} final step")
+
+                if self.player_id == 0:
+                    result = await self.challenger_final_step(content, correct_format)
+                else:
+                    result = await self.solver_final_step(content, correct_format)
+        except Exception:
+            await self._ensure_coordinator_notified()
+            raise
+
+        if result.episode_done:
+            await self._ensure_coordinator_notified()
+
+        return result
                 
 
     @staticmethod
@@ -602,8 +636,6 @@ class SPEnv(Env):
             tools=search_tool.get_tool_schemas(),
             system_prompt=CHALLENGER_SYSTEM_PROMPT if player_id == 0 else SOLVER_SYSTEM_PROMPT,
         )
-
-
 
 
 @dataclass(frozen=True)
@@ -633,7 +665,7 @@ class SPDataset(RLDataset):
         # optional args
         convo_prefix: list[renderers.Message] | None = None,
         seed: int = 0,
-        split: Literal["train", "test"] = "train",
+        split: Literal["fineweb", "bcplus", "browsecomp", "browsecomp_plus", "dsqa"] = "fineweb",
         subset_size: int | None = None,
         max_trajectory_tokens: int = 32 * 1024,
         max_tokens: int = 1024,
@@ -642,6 +674,7 @@ class SPDataset(RLDataset):
         handling_mode: Literal["raise", "return", "continue"] = "raise",
         difficulty_reward_mode: Literal["variance", "linear", "none"] = "variance",
         tool_reward_mode: Literal["max", "mean", "none"] = "max",
+        do_fallback_challenger: bool = True,
     ):
         self.batch_size: int = batch_size
         self.group_size: int = group_size
@@ -652,10 +685,11 @@ class SPDataset(RLDataset):
         self.search_tool: WebSearchTool = search_tool
         self.seed: int = seed
         self.split: Literal["fineweb", "bcplus", "browsecomp", "browsecomp_plus", "dsqa"] = split
+        self.do_fallback_challenger: bool = do_fallback_challenger
 
         if split in ["fineweb", "bcplus"]:
             self.ds: list[SeedDatum] = load_seed_dataset(split, num_samples=subset_size)
-        elif split in ["browsecomp", "browsecomp_plus", "dsqa"]:
+        elif split in ["browsecomp", "browsecomp_plus", "dsqa", "browsecomp_plus_train", "browsecomp_plus_test"]:
             self.ds: list[QADatum] = load_qa_dataset(split)
         else:
             raise ValueError(f"Unknown dataset: {split}")
@@ -665,11 +699,24 @@ class SPDataset(RLDataset):
         self.difficulty_reward_mode: Literal["variance", "linear", "none"] = difficulty_reward_mode
         self.tool_reward_mode: Literal["max", "mean", "none"] = tool_reward_mode
         # shuffle with seed
-        rng = random.Random(self.seed)
-        rng.shuffle(self.ds)
+        self.rng = random.Random(self.seed)
+        self.rng.shuffle(self.ds)
         # Limit dataset size if subset_size is specified
+        self.subset_size: int | None = subset_size
         if subset_size is not None:
             self.ds = self.ds[:subset_size]
+
+    def _get_batch_rows(self, index: int) -> list:
+        """Get rows for a batch, wrapping around the dataset for multi-epoch support."""
+        n = len(self.ds)
+        start = (index * self.batch_size) % n
+        if start + self.batch_size > n:
+            data = self.ds[start:]
+            # for the next epoch, we need to shuffle the data
+            self.rng.shuffle(self.ds)
+            return data
+        else:
+            return self.ds[start:start + self.batch_size]
 
     def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
         # HY: this might be the only thing that we really need to change.
@@ -677,10 +724,12 @@ class SPDataset(RLDataset):
         # Each challenger environment will have group_size solver environments
         # Thus, each row will result in group_size challenger environments and group_size*group_size solver environments
 
+        rows = self._get_batch_rows(index)
+
         if self.self_play and self.split in ["fineweb", "bcplus"]:
             # each challenger and its set of group_size solver environments will share the same coordinator
             batches = []
-            for idx, row in enumerate(self.ds[index * self.batch_size : (index + 1) * self.batch_size]):
+            for idx, row in enumerate(rows):
                 coordinator = [SPCoordinator(num_solvers=self.group_size, document=row["document"], coordinator_id=i) for i in range(self.group_size)]
                 challenger_env = self._make_challenger_env_group_builder(row, self.group_size, coordinator=coordinator)
                 batches.append(challenger_env)
@@ -688,20 +737,20 @@ class SPDataset(RLDataset):
                 batches.extend(solver_envs)
             return batches
 
-        elif self.split in ["browsecomp", "browsecomp_plus", "dsqa"]:
+        elif self.split in ["browsecomp", "browsecomp_plus", "browsecomp_plus_train", "browsecomp_plus_test", "dsqa"]:
             # just testing the challenger
             # need some special logic for the solver groups so it doesn't wait for the challenger to make a move
-            return [self._make_solver_env_group_builder(row=None, group_size=self.group_size, coordinator=None, problem=row) for row in self.ds[index * self.batch_size : (index + 1) * self.batch_size]]
-        
+            return [self._make_solver_env_group_builder(row=None, group_size=self.group_size, coordinator=None, problem=row) for row in rows]
+
         else:
             # just training the challenger
             return [
                 self._make_env_group_builder(row, self.group_size)
-                for row in self.ds[index * self.batch_size : (index + 1) * self.batch_size]
+                for row in rows
             ]
 
     def __len__(self) -> int:
-        return len(self.ds) // self.batch_size
+        return self.subset_size // self.batch_size
     
     def _make_challenger_env_group_builder(self, row: SeedDatum, group_size: int, coordinator: SPCoordinator | None = None) -> SPGroupBuilder:
         return SPGroupBuilder(
@@ -721,6 +770,7 @@ class SPDataset(RLDataset):
                 handling_mode=self.handling_mode,
                 difficulty_reward_mode=self.difficulty_reward_mode,
                 tool_reward_mode=self.tool_reward_mode,
+                do_fallback_challenger=self.do_fallback_challenger,
             ),
             num_envs=group_size,
         )
@@ -786,6 +836,7 @@ class SPDatasetBuilder(RLDatasetBuilder):
     model_name_for_tokenizer: str
     renderer_name: str
     search_tool_config: WebSearchToolConfig
+    do_fallback_challenger: bool = True
 
     max_eval_size: int = 1024
     max_trajectory_tokens: int = 32 * 1024
@@ -818,6 +869,7 @@ class SPDatasetBuilder(RLDatasetBuilder):
             handling_mode=self.handling_mode,
             difficulty_reward_mode=self.difficulty_reward_mode,
             tool_reward_mode=self.tool_reward_mode,
+            do_fallback_challenger=self.do_fallback_challenger,
         )
 
         # now we make the eval dataset, but we are only going evaluate the solver

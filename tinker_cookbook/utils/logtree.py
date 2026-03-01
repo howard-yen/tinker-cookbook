@@ -618,6 +618,69 @@ def scope_details(summary: str) -> Iterator[None]:
         yield
 
 
+# Overloads the parameterized usage
+@overload
+def scope_details_decorator(summary: str) -> Callable[[F], F]: ...  # String summary
+
+
+# Overloads the bare usage
+@overload
+def scope_details_decorator(summary: F) -> F: ...  # Bare: @scope_details_decorator
+
+
+def scope_details_decorator(
+    summary: str | F,
+) -> F | Callable[[F], F]:
+    """
+    Decorator to wrap function in a scope_details.
+
+    Args:
+        summary: String or function returning string
+
+    Examples:
+        @logtree.scope_details_decorator
+        async def process_batch():
+            ...
+
+        @logtree.scope_details_decorator("Handling item")
+        def handle_item():
+            ...
+    """
+    summary_str = summary if isinstance(summary, str) else summary.__name__
+
+    def _wrap(fn: F) -> F:
+        if inspect.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def aw(*args: Any, **kwargs: Any) -> Any:
+                # Graceful degradation: if logging is disabled, just run the function
+                if not _is_logging_enabled():
+                    return await fn(*args, **kwargs)
+
+                with scope_details(summary_str):
+                    return await fn(*args, **kwargs)
+
+            return aw  # type: ignore
+        else:
+
+            @functools.wraps(fn)
+            def w(*args: Any, **kwargs: Any) -> Any:
+                # Graceful degradation: if logging is disabled, just run the function
+                if not _is_logging_enabled():
+                    return fn(*args, **kwargs)
+
+                with scope_details(summary_str):
+                    return fn(*args, **kwargs)
+
+            return w  # type: ignore
+
+    if isinstance(summary, str):
+        return _wrap
+    else:
+        fn = summary
+        return _wrap(fn)
+
+
 # Public API: Content
 
 

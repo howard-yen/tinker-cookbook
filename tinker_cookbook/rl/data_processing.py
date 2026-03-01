@@ -83,7 +83,11 @@ def _flatten_chunks(chunks: list[tinker.ModelInputChunk]) -> FlatOb:
     return out
 
 
-def trajectory_to_data(traj: Trajectory, traj_advantage: float) -> list[tinker.Datum]:
+def trajectory_to_data(
+    traj: Trajectory,
+    traj_advantage: float,
+    per_transition_advantages: list[float] | None = None,
+) -> list[tinker.Datum]:
     """
     Return one or more Datum objects corresponding to the trajectory.
     If the sequence grows by appending, i.e., each successive observation contains
@@ -141,8 +145,14 @@ def trajectory_to_data(traj: Trajectory, traj_advantage: float) -> list[tinker.D
             },
         )
 
+    if per_transition_advantages is not None:
+        assert len(per_transition_advantages) == len(traj.transitions), (
+            f"per_transition_advantages length ({len(per_transition_advantages)}) "
+            f"must match number of transitions ({len(traj.transitions)})"
+        )
+
     data: list[tinker.Datum] = []
-    for transition in traj.transitions:
+    for transition_idx, transition in enumerate(traj.transitions):
         ob = transition.ob
         ob_flat = _flatten_chunks(ob.chunks)
         ac_with_logprobs = transition.ac
@@ -160,8 +170,13 @@ def trajectory_to_data(traj: Trajectory, traj_advantage: float) -> list[tinker.D
         SequenceAccumulator.sampled_logprobs.extend(
             [0.0] * delta_ob_len + ac_with_logprobs.logprobs
         )
+        # Determine advantage for this transition
+        if per_transition_advantages is not None:
+            adv = per_transition_advantages[transition_idx]
+        else:
+            adv = traj_advantage
         SequenceAccumulator.advantages.extend(
-            [0] * delta_ob_len + [traj_advantage] * len(ac_with_logprobs.tokens)
+            [0] * delta_ob_len + [adv] * len(ac_with_logprobs.tokens)
         )
         SequenceAccumulator.mask.extend([0.0] * delta_ob_len + [1.0] * len(ac_with_logprobs.tokens))
 
@@ -173,22 +188,48 @@ def trajectory_to_data(traj: Trajectory, traj_advantage: float) -> list[tinker.D
 
 def assemble_training_data(
     trajectory_groups_P: List[TrajectoryGroup],
-    advantages_P: List[torch.Tensor],
+    advantages_P: List[torch.Tensor] | None = None,
+    per_step_advantages_P: list[list[list[float]]] | None = None,
 ) -> tuple[List[tinker.Datum], List[dict[str, int]]]:
-    """Convert trajectories to training data format."""
+    """Convert trajectories to training data format.
+
+    Exactly one of advantages_P or per_step_advantages_P must be provided.
+
+    Args:
+        trajectory_groups_P: List of trajectory groups.
+        advantages_P: Scalar advantage per trajectory (GRPO-style).
+        per_step_advantages_P: Per-transition advantages from GAE.
+            Shape: per_step_advantages_P[problem][trajectory][transition].
+    """
+    if (advantages_P is None) == (per_step_advantages_P is None):
+        raise ValueError("Exactly one of advantages_P or per_step_advantages_P must be provided")
+
     data_D: list[tinker.Datum] = []
     metadata_D: list[dict[str, int]] = []
 
-    for i_group, (traj_group, advantages_G) in enumerate(
-        safezip(trajectory_groups_P, advantages_P)
-    ):
-        for i_traj, (traj, traj_advantage) in enumerate(
-            safezip(traj_group.trajectories_G, advantages_G)
+    if advantages_P is not None:
+        for i_group, (traj_group, advantages_G) in enumerate(
+            safezip(trajectory_groups_P, advantages_P)
         ):
-            # Build the full sequence from the trajectory
-            new_data = trajectory_to_data(traj, float(traj_advantage))
-            data_D.extend(new_data)
-            metadata_D.extend([dict(group_idx=i_group, traj_idx=i_traj) for _ in new_data])
+            for i_traj, (traj, traj_advantage) in enumerate(
+                safezip(traj_group.trajectories_G, advantages_G)
+            ):
+                new_data = trajectory_to_data(traj, float(traj_advantage))
+                data_D.extend(new_data)
+                metadata_D.extend([dict(group_idx=i_group, traj_idx=i_traj) for _ in new_data])
+    else:
+        assert per_step_advantages_P is not None
+        for i_group, (traj_group, per_step_advantages_G) in enumerate(
+            safezip(trajectory_groups_P, per_step_advantages_P)
+        ):
+            for i_traj, (traj, per_step_adv) in enumerate(
+                safezip(traj_group.trajectories_G, per_step_advantages_G)
+            ):
+                new_data = trajectory_to_data(
+                    traj, traj_advantage=0.0, per_transition_advantages=per_step_adv
+                )
+                data_D.extend(new_data)
+                metadata_D.extend([dict(group_idx=i_group, traj_idx=i_traj) for _ in new_data])
 
     return data_D, metadata_D
 

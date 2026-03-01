@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Literal
 
 import aiohttp
 import chz
@@ -44,6 +44,23 @@ VECTOR_SEARCH_TOOL: ToolSpec = {
         "required": ["query_list"],
     }
 }
+
+SINGLE_SEARCH_TOOL: ToolSpec = {
+    "name": "search",
+    "description": "Search the web for relevant information with the query. Returns a list of urls with a snippet of the content in the url.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query given to the search engine.",
+            }
+        },
+        "required": ["query"],
+    }
+}
+
+
 
 WEB_VISIT_TOOL: ToolSpec = {
     "name": "visit",
@@ -99,6 +116,31 @@ VECTOR_VISIT_TOOL: ToolSpec = {
     },
 }
 
+SINGLE_VISIT_TOOL: ToolSpec = {
+    "name": "visit",
+    "description": "Browse the web page by its url. This returns the text content of the web page, with at most 10000 characters. Optionally, you can search for a specific query in the url, and the tool will perform fuzzy matching to find the part of the page that contains the highest textual similarity to the query.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "Url of the web page to browse. This tool will return the text content of the page.",
+            },
+            "query": {
+                "type": "string",
+                "nullable": True,
+                "description": "Query to search for in the url. The tool will perform fuzzy matching to find the part of the page that contains the highest textual similarity to the query. If given an empty query, the tool will return the beginning of the page.",
+            }
+        },
+        "required": ["url"],
+        "additionalProperties": False
+    },
+    "outputSchema": {
+        "type": "string",
+        "description": "The browse result in JSON format",
+    },
+}
+
 
 class ToolClientInterface(ABC):
     @abstractmethod
@@ -116,7 +158,7 @@ class WebSearchToolConfig:
     scoring_func: str = "rouge"
     chunking_func: str = "newline"
     timeout: float = 300.0  # Timeout in seconds (default 5 minutes)
-    vector_search: bool = False
+    search_mode: Literal["default", "vector", "single"] = "default"
 
 
 class WebSearchTool(ToolClientInterface):
@@ -126,12 +168,44 @@ class WebSearchTool(ToolClientInterface):
         self.content_length = config.content_length
         self.scoring_func = config.scoring_func
         self.chunking_func = config.chunking_func
-        self.vector_search = config.vector_search
+        self.search_mode = config.search_mode
         self.timeout = aiohttp.ClientTimeout(total=config.timeout)
 
-
     def get_tool_schemas(self) -> list[ToolSpec]:
-        return [WEB_SEARCH_TOOL, WEB_VISIT_TOOL] if not self.vector_search else [VECTOR_SEARCH_TOOL, VECTOR_VISIT_TOOL]
+        if self.search_mode == "vector":
+            return [VECTOR_SEARCH_TOOL, VECTOR_VISIT_TOOL]
+        elif self.search_mode == "single":
+            return [SINGLE_SEARCH_TOOL, SINGLE_VISIT_TOOL]
+        else:
+            return [WEB_SEARCH_TOOL, WEB_VISIT_TOOL]
+
+    def validate_and_extract_search_args(self, args: dict) -> tuple[list[str] | None, str | None]:
+        """Validate and extract query list from search tool arguments.
+
+        Returns (query_list, error_message). If error_message is not None, the args are invalid.
+        """
+        if self.search_mode == "single":
+            if "query" not in args:
+                return None, f"Invalid argument in tool calls: {args}\nMake sure to include the required 'query' argument when using the search tool."
+            return [args["query"]], None
+        else:
+            if "query_list" not in args:
+                return None, f"Invalid argument in tool calls: {args}\nMake sure to include the required 'query_list' argument when using the search tool."
+            return args["query_list"], None
+
+    def validate_and_extract_visit_args(self, args: dict) -> tuple[tuple[list[str], list[str] | None] | None, str | None]:
+        """Validate and extract url list and query list from visit tool arguments.
+
+        Returns ((url_list, query_list), error_message). If error_message is not None, the args are invalid.
+        """
+        if self.search_mode == "single":
+            if "url" not in args:
+                return None, f"Invalid argument in tool calls: {args}\nMake sure to include the required 'url' argument when using the visit tool."
+            return ([args["url"]], [args.get("query", "")]), None
+        else:
+            if "url_list" not in args:
+                return None, f"Invalid argument in tool calls: {args}\nMake sure to include the required 'url_list' argument when using the visit tool."
+            return (args["url_list"], args.get("query_list")), None
 
 
     async def batch_search(self, query_list: list[str]) -> str:
@@ -217,11 +291,16 @@ class WebSearchTool(ToolClientInterface):
 
     async def invoke(self, tool_call: ToolCall) -> list[Message]:
         if tool_call.function.name == "search":
-            output = await self.batch_search(tool_call.function.arguments["query_list"])
+            query_list, error = self.validate_and_extract_search_args(tool_call.function.arguments)
+            if error:
+                return [Message(role="tool", content=error)]
+            output = await self.batch_search(query_list)
             return [Message(role="tool", content=output)]
-        elif tool_call.function.name == "browse":
-            id_list = json.loads(tool_call.function.arguments)["id_list"]
-            query_list = json.loads(tool_call.function.arguments)["query_list"]
+        elif tool_call.function.name == "visit":
+            visit_args, error = self.validate_and_extract_visit_args(tool_call.function.arguments)
+            if error:
+                return [Message(role="tool", content=error)]
+            id_list, query_list = visit_args
             output = await self.batch_browse(id_list, query_list)
             return [Message(role="tool", content=output)]
         else:

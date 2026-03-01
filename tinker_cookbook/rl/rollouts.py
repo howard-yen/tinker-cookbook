@@ -1,6 +1,7 @@
 import asyncio
 from typing import Any, Sequence
 
+import tinker
 from tinker_cookbook.completers import TokenCompleter
 from tinker_cookbook.rl.types import (
     Env,
@@ -23,10 +24,15 @@ def _truncate_log_value(value: Any, max_len: int = LOG_VALUE_MAX_LEN) -> tuple[s
     return str_value, False
 
 
-@logtree.scope_header_decorator
+# @logtree.scope_header_decorator
+@logtree.scope_details_decorator("Single Rollout")
 async def do_single_rollout(policy: TokenCompleter, env: Env) -> Trajectory:
     transitions = []
     ob, stop_condition = await env.initial_observation()
+    if ob is None:
+        # special case, but I don't want to brick the dependent functions, so we'll still have a final observation with empty transitions
+        return Trajectory(transitions=[], final_ob=tinker.ModelInput.empty())
+
     while True:
         ac_with_logprobs = await policy(ob, stop_condition)
         step_result = await env.step(ac_with_logprobs.tokens)
@@ -46,7 +52,8 @@ async def do_single_rollout(policy: TokenCompleter, env: Env) -> Trajectory:
     return Trajectory(transitions=transitions, final_ob=ob)
 
 
-@logtree.scope_header_decorator
+# @logtree.scope_header_decorator
+@logtree.scope_details_decorator("Group Rollout")
 async def do_group_rollout(
     env_group_builder: EnvGroupBuilder, policy: TokenCompleter
 ) -> TrajectoryGroup:

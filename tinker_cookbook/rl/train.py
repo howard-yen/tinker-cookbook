@@ -26,6 +26,7 @@ from tinker_cookbook.rl.data_processing import (
     compute_advantages,
     remove_constant_reward_groups,
 )
+from tinker_cookbook.rl.value_function import ValueFunctionConfig, ValueModel
 from tinker_cookbook.rl.metric_util import RLTestSetEvaluator, compute_trajectory_metrics
 from tinker_cookbook.rl.metrics import (
     compute_kl_sample_train,
@@ -365,6 +366,8 @@ class Config:
     stream_minibatch_config: StreamMinibatchConfig | None = None
     # Optional service base URL override (primarily internal/dev use).
     base_url: str | None = None
+    # Value function config for GAE-based per-step advantages (None = GRPO).
+    value_function_config: ValueFunctionConfig | None = None
 
     # -------------------------------------------------------------------------
     # Checkpoint retention and logging detail (advanced)
@@ -457,7 +460,7 @@ async def do_sync_training_with_stream_minibatch(
         t_start = time.time()
 
         # Run evaluations
-        if (cfg.eval_every > 0 and (i_batch + 1) % cfg.eval_every == 0 and i_batch > 0) or i_batch == end_batch - 1:
+        if (cfg.eval_every > 0 and i_batch % cfg.eval_every == 0 and i_batch > start_batch) or i_batch == end_batch - 1:
             with timed("run_evals", metrics):
                 eval_metrics = await run_evaluations_parallel(
                     evaluators, sampling_client, cfg, i_batch
@@ -760,7 +763,7 @@ async def do_async_training(
             # while we're running the evals
             sampling_client_eval_step = sampling_client_step
             sampling_client_eval = sampling_client
-            if cfg.eval_every > 0 and (sampling_client_eval_step + 1) % cfg.eval_every == 0 and sampling_client_eval_step > 0:
+            if cfg.eval_every > 0 and sampling_client_eval_step % cfg.eval_every == 0 and sampling_client_eval_step > start_batch:
                 with timed("run_evals", metrics):
                     for evaluator in evaluators:
                         eval_metrics = await evaluator(sampling_client_eval)
@@ -794,6 +797,12 @@ async def do_group_rollout_and_filter_constant_reward(
 
     with logtree.optional_enable_logging(enable_logging):
         trajectory_group = await do_group_rollout(env_group_builder, policy)
+    
+    # Remove trajectories with no transitions, which means the rollout failed
+    # this should only happens in special cases, where we want to remove the entire group
+    if any(len(traj.transitions) == 0 for traj in trajectory_group.trajectories_G):
+        assert all(len(traj.transitions) == 0 for traj in trajectory_group.trajectories_G), "Some trajectories have transitions, some don't. This should never happen."
+        return None
 
     # Remove if all trajectories have the same reward
     if do_remove_constant_reward_groups and all_same(trajectory_group.get_total_rewards()):
@@ -835,6 +844,7 @@ async def prepare_minibatch(
     kl_reference_client: tinker.SamplingClient | None,
     kl_penalty_coef: float,
     kl_discount_factor: float,
+    value_model: ValueModel | None = None,
 ) -> tuple[list[tinker.Datum], dict[str, Any]]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
 
@@ -843,14 +853,29 @@ async def prepare_minibatch(
     taglist_P = [env_group_builder.logging_tags() for env_group_builder in env_group_builders_P]
     metrics.update(compute_trajectory_metrics(trajectory_groups_P, taglist_P))
 
-    # Print up to two trajectory groups
-    for traj_group in trajectory_groups_P[:2]:
+    # Print up to one trajectory group
+    for traj_group in trajectory_groups_P[:1]:
         print_group(traj_group, tokenizer)
 
     # Assemble training data
     with timed("assemble_training_data", metrics):
-        advantages_P = compute_advantages(trajectory_groups_P)
-        data_D, _metadata_D = assemble_training_data(trajectory_groups_P, advantages_P)
+        if value_model is not None:
+            from tinker_cookbook.rl.value_function import compute_gae_advantages_for_batch  # noqa: F811
+
+            per_step_advantages_P = compute_gae_advantages_for_batch(
+                trajectory_groups_P,
+                value_model,
+                gamma=value_model.config.gamma,
+                gae_lambda=value_model.config.gae_lambda,
+            )
+            data_D, _metadata_D = assemble_training_data(
+                trajectory_groups_P, per_step_advantages_P=per_step_advantages_P
+            )
+        else:
+            advantages_P = compute_advantages(trajectory_groups_P)
+            data_D, _metadata_D = assemble_training_data(
+                trajectory_groups_P, advantages_P=advantages_P
+            )
 
     # Incorporate KL penalty if configured
     if kl_penalty_coef > 0 and kl_reference_client is not None:
@@ -1047,6 +1072,7 @@ async def do_train_step_and_get_sampling_client(
     env_group_builders_P: Sequence[EnvGroupBuilder],
     trajectory_groups_P: list[TrajectoryGroup],
     learning_rate: float | None = None,
+    value_model: ValueModel | None = None,
 ) -> tuple[tinker.SamplingClient, dict[str, Any]]:
     update_scope_context({"step": i_batch})
 
@@ -1059,6 +1085,7 @@ async def do_train_step_and_get_sampling_client(
         kl_reference_client,
         kl_penalty_coef=cfg.kl_penalty_coef,
         kl_discount_factor=cfg.kl_discount_factor,
+        value_model=value_model,
     )
     metrics.update(prepare_minibatch_metrics)
 
@@ -1072,6 +1099,14 @@ async def do_train_step_and_get_sampling_client(
             loss_fn_config=cfg.loss_fn_config,
             metrics=metrics,
         )
+
+    # Train value model if configured
+    if value_model is not None:
+        with timed("value_model_training", metrics):
+            vf_metrics = value_model.train_on_batch(
+                trajectory_groups_P, gamma=value_model.config.gamma
+            )
+            metrics.update({f"value_fn/{k}": v for k, v in vf_metrics.items()})
 
     sampling_client, full_batch_metrics = await compute_full_batch_metrics_and_get_sampling_client(
         training_client,
@@ -1101,6 +1136,7 @@ async def do_sync_training(
     dataset: RLDataset,
     ml_logger: ml_log.Logger,
     tokenizer: Tokenizer,
+    value_model: ValueModel | None = None,
 ):
     """Implements fully synchronous on-policy training"""
     # Initial sampling client
@@ -1118,7 +1154,7 @@ async def do_sync_training(
         t_start = time.time()
 
         # Run evaluations
-        if cfg.eval_every > 0 and (i_batch + 1) % cfg.eval_every == 0 and i_batch > 0:
+        if cfg.eval_every > 0 and i_batch % cfg.eval_every == 0 and i_batch > start_batch:
             with timed("run_evals", metrics):
                 eval_metrics = await run_evaluations_parallel(
                     evaluators, sampling_client, cfg, i_batch
@@ -1151,6 +1187,20 @@ async def do_sync_training(
                 ),
                 desc=f"Sampling batch {i_batch}",
             )
+            # Filter out failed groups (e.g. all-empty trajectories from challenger failure)
+            # and keep env_group_builders_P aligned
+            paired = [(b, g) for b, g in safezip(env_group_builders_P, trajectory_groups_P) if g is not None]
+            if paired:
+                env_group_builders_P, trajectory_groups_P = zip(*paired)
+                env_group_builders_P = list(env_group_builders_P)
+                trajectory_groups_P = list(trajectory_groups_P)
+            else:
+                env_group_builders_P = []
+                trajectory_groups_P = []
+
+        if not trajectory_groups_P:
+            logger.warning("All trajectory groups failed, skipping training step")
+            continue
 
         if cfg.remove_constant_reward_groups:
             trajectory_groups_P = remove_constant_reward_groups(trajectory_groups_P)
@@ -1165,6 +1215,7 @@ async def do_sync_training(
             env_group_builders_P,
             trajectory_groups_P,
             learning_rate=scheduled_lr,
+            value_model=value_model,
         )
 
         # Log metrics
@@ -1260,6 +1311,11 @@ async def main(
     else:
         kl_reference_client = None
 
+    # Initialize value model if configured
+    value_model = None
+    if cfg.value_function_config is not None:
+        value_model = ValueModel(cfg.value_function_config)
+
     # Training loop
     if cfg.async_config is not None:
         training_func = do_async_training
@@ -1267,6 +1323,17 @@ async def main(
         training_func = do_sync_training_with_stream_minibatch
     else:
         training_func = do_sync_training
+
+    # Only sync training supports value model currently
+    extra_kwargs: dict[str, Any] = {}
+    if training_func is do_sync_training and value_model is not None:
+        extra_kwargs["value_model"] = value_model
+    elif value_model is not None:
+        logger.warning(
+            "Value function is only supported with sync training. "
+            "Falling back to GRPO advantages."
+        )
+
     await training_func(
         start_batch=start_batch,
         end_batch=num_batches,
@@ -1278,6 +1345,7 @@ async def main(
         dataset=dataset,
         ml_logger=ml_logger,
         tokenizer=tokenizer,
+        **extra_kwargs,
     )
 
     # Save final checkpoint
