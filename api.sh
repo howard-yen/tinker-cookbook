@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Self-play offline evaluation
-# Override any parameter by setting env var: LR=1e-4 ./run.sh
+# API-based evaluation using litellm
+# Override any parameter by setting env var: MODEL=anthropic/claude-sonnet-4-20250514 ./api.sh
 #
 # Modes:
 #   MODE=solver (default) — evaluate on QA datasets (browsecomp, dsqa, etc.)
@@ -10,40 +10,38 @@
 MODE=${MODE:-'solver'}
 
 # Model configuration
-BASE_MODEL=${BASE_MODEL:-'openai/gpt-oss-120b'}
-TINKER_CHECKPOINT_URL=${TINKER_CHECKPOINT_URL:-''}
-MAX_TOKENS=${MAX_TOKENS:-4096}
+MODEL=${MODEL:-'azure/o3'}
+MAX_TOKENS=${MAX_TOKENS:-8192}
 
 # Evaluation parameters
-N=${N:-150}
+N=${N:-100}
 SEED=${SEED:-42}
 SPLITS=${SPLITS:-'browsecomp,dsqa,browsecomp_plus'}
 CORPUS_SPLITS=${CORPUS_SPLITS:-'bcplus'}
-
-# RL-specific parameters
-MAX_NUM_CALLS=${MAX_NUM_CALLS:-25}
-HANDLING_MODE=${HANDLING_MODE:-'continue'}
+CONCURRENCY=${CONCURRENCY:-16}
+MAX_NUM_CALLS=${MAX_NUM_CALLS:-100}
+MAX_TRAJECTORY_TOKENS=${MAX_TRAJECTORY_TOKENS:-131_072}
 
 # Web search tool settings
 SEARCH_MODE=${SEARCH_MODE:-default}
 PORT=${PORT:-8000}
-WEB_TOPK=${WEB_TOPK:-10}
-WEB_CONTENT_LENGTH=${WEB_CONTENT_LENGTH:-5000}
+WEB_TOPK=${WEB_TOPK:-5}
+WEB_CONTENT_LENGTH=${WEB_CONTENT_LENGTH:-10000}
 WEB_SCORING_FUNC=${WEB_SCORING_FUNC:-'rouge'}
 WEB_CHUNKING_FUNC=${WEB_CHUNKING_FUNC:-'newline'}
 WEB_TIMEOUT=${WEB_TIMEOUT:-300.0}
 
-# Build command with required parameters
-CMD="uv run python -m tinker_cookbook.recipes.self_play.eval.offline_eval \
+CMD="uv run python -m tinker_cookbook.recipes.self_play.eval.api_eval \
   mode=$MODE \
-  base_model=$BASE_MODEL \
+  model=$MODEL \
+  max_tokens=$MAX_TOKENS \
   max_eval_samples=$N \
   seed=$SEED \
   splits=$SPLITS \
   corpus_splits=$CORPUS_SPLITS \
-  max_tokens=$MAX_TOKENS \
+  concurrency=$CONCURRENCY \
   max_num_calls=$MAX_NUM_CALLS \
-  handling_mode=$HANDLING_MODE \
+  max_trajectory_tokens=$MAX_TRAJECTORY_TOKENS \
   web_tool_port=$PORT \
   web_tool_topk=$WEB_TOPK \
   web_tool_content_length=$WEB_CONTENT_LENGTH \
@@ -52,9 +50,4 @@ CMD="uv run python -m tinker_cookbook.recipes.self_play.eval.offline_eval \
   web_tool_timeout=$WEB_TIMEOUT \
   search_mode=$SEARCH_MODE"
 
-# Add optional parameters if set
-[[ -n "$TINKER_CHECKPOINT_URL" ]] && CMD="$CMD tinker_checkpoint_url=$TINKER_CHECKPOINT_URL"
-
-# Execute command
 eval $CMD
-

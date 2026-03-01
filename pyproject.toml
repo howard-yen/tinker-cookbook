@@ -33,6 +33,7 @@ dependencies = [
     "modal",
     "wandb",
     "scikit-learn>=1.8.0",
+    "nltk>=3.9.2",
 ]
 
 [project.urls]
